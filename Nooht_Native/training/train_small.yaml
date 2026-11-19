@@ -1,0 +1,22 @@
+# 训练加速栈（小规模）：任务包第十节
+# FlashAttention + Sequence Packing + DeepSpeed ZeRO-2 或 FSDP + 异步 Checkpointing
+# 两套通过配置切换，代码结构一致；小规模验证，大规模只做接口与流程验证
+scale: small
+attention: flash_attention
+sequence_packing: true
+parallelism:
+  strategy: deepspeed_zero2  # 或 fsdp，二选一
+checkpoint:
+  async: true
+  interval_steps: 500
+data:
+  max_seq_len: 8192
+  packing: true
+optimizer:
+  name: adamw
+  lr: 2.0e-5
+training:
+  per_device_batch: 4
+  grad_accum: 8
+  bf16: true
+version: v0.1.0-dev
