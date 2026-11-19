@@ -1,0 +1,25 @@
+# 训练加速栈（大规模）：任务包第十节
+# 跨节点拓扑感知通信 + DualPipe / 1F1B + DeepSeek 3FS + 异步 Checkpointing + Sequence Packing
+# 本阶段只做接口与流程验证，不做实际大规模训练
+scale: large
+attention: flash_attention
+sequence_packing: true
+parallelism:
+  strategy: dualpipe_1f1b  # 或 1F1B
+  topology_aware_comm: true
+storage:
+  filesystem: deepseek_3fs
+checkpoint:
+  async: true
+  interval_steps: 1000
+data:
+  max_seq_len: 32768
+  packing: true
+optimizer:
+  name: adamw
+  lr: 2.0e-5
+training:
+  per_device_batch: 2
+  grad_accum: 16
+  bf16: true
+version: v0.1.0-dev
