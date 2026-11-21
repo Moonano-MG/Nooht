@@ -76,12 +76,17 @@ class NoildLayer(nn.Module):
         """负载大时扩大重判间隔 N（供调用方按负载调用）。"""
         return self.rejudge.update_load(load_factor)
 
-    def _general_for_domain(self, domain_id: int) -> GeneralExpert:
-        """按领域确定性选择通用专家：同一输入必选同一专家（可复现）。"""
-        return self.generals[int(domain_id) % len(self.generals)]
+    def _general_for_domain(self, domain_id: int, stage_index: int = 0) -> GeneralExpert:
+        """按领域与通用阶段确定性选择专家。
+
+        同一领域在同一阶段可复现；Soleinoo 的前置与末尾通用阶段轮换到
+        不同专家（当通用专家数大于 1），实现两个接力角色而非重复调用同一份权重。
+        """
+        return self.generals[(int(domain_id) + stage_index) % len(self.generals)]
 
     def _run_generals(
-        self, hidden: torch.Tensor, router_out: RouterOutput, return_logits: bool
+        self, hidden: torch.Tensor, router_out: RouterOutput, return_logits: bool,
+        stage_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """按每个 token 的领域确定性选择通用专家，避免批次只用首样本领域。"""
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
@@ -95,7 +100,7 @@ class NoildLayer(nn.Module):
             mask = flat_ids == domain
             if not bool(mask.any()):
                 continue
-            expert_out, expert_mtp = self._general_for_domain(domain)(
+            expert_out, expert_mtp = self._general_for_domain(domain, stage_index)(
                 flat_hidden[mask], return_logits=return_logits
             )
             out[mask] = expert_out
@@ -153,6 +158,7 @@ class NoildLayer(nn.Module):
         if not self.training and step == 0 and self._cached_router is not None:
             self._cached_router = None
             self.rejudge.last_rejudge_step = -10**9
+            self.rejudge.last_uncertainty_rejudge_step = -10**9
             self.rejudge.last_hidden = None
         # 生成中按节奏重判，间隔内复用缓存；按序列池化并保留 batch 维。
         pooled = hidden.mean(dim=-2) if hidden.dim() > 2 else hidden
@@ -232,6 +238,7 @@ class NoildLayer(nn.Module):
         mtp_logits = None
         primary_source = "draft"  # 合并专家的 primary 来源（draft 或 general）
         primary_hidden = None
+        general_stage_index = 0
 
         # 2) 按路径串联（跳过 router 阶段，它已在上面执行）
         for stage in self.path:
@@ -246,8 +253,10 @@ class NoildLayer(nn.Module):
                 primary_source = "draft"
             elif stage == "general":
                 current, mtp_logits = self._run_generals(
-                    current, router_out, return_logits=compute_aux_logits
+                    current, router_out, return_logits=compute_aux_logits,
+                    stage_index=general_stage_index,
                 )
+                general_stage_index += 1
                 primary_hidden = current
                 primary_source = "general"
             elif stage == "vertical":

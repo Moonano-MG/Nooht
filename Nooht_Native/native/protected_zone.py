@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 import torch
 from torch import nn
@@ -122,6 +123,7 @@ class ThinkingMemoryBlock:
     entries: dict[str, dict[str, str]] = field(default_factory=dict)
     _last_update_step: int = -10**9
     _has_new_info: bool = False
+    _pending_entries: dict[str, dict[str, str]] = field(default_factory=dict)
 
     CATEGORIES = ("variables", "constraints", "todos", "conclusions")
 
@@ -144,6 +146,80 @@ class ThinkingMemoryBlock:
         self._last_update_step = step
         self._has_new_info = False
         return True
+
+    @staticmethod
+    def parse_updates(text: str) -> dict[str, dict[str, str]]:
+        """把思考文本解析为变量/约束/待办/结论条目。
+
+        显式格式示例：\n变量: name=value\n约束: 只输出 JSON\n待办: 检查路径\n结论: 输入有效。
+        未标记的句子分别存为 conclusions/item_N，避免整段覆盖为单一条目。
+        """
+        aliases = {
+            "变量": "variables", "变量表": "variables", "variable": "variables", "variables": "variables",
+            "约束": "constraints", "constraint": "constraints", "constraints": "constraints",
+            "待办": "todos", "todo": "todos", "todos": "todos",
+            "结论": "conclusions", "结论项": "conclusions", "conclusion": "conclusions", "conclusions": "conclusions",
+        }
+        updates: dict[str, dict[str, str]] = {category: {} for category in ThinkingMemoryBlock.CATEGORIES}
+        counters = {category: 0 for category in ThinkingMemoryBlock.CATEGORIES}
+        for raw in text.splitlines():
+            line = re.sub(r"^\s*(?:[-*•]\s*)?", "", raw).strip()
+            if not line:
+                continue
+            match = re.match(r"^\[?([^]：:]+)\]?\s*[:：]\s*(.*)$", line)
+            category = aliases.get(match.group(1).strip().lower()) if match else None
+            if category is None:
+                category = "conclusions"
+                # 未标记/未知前缀按句子拆成多个独立结论，而非整段覆盖。
+                values = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s*", line) if part.strip()]
+            else:
+                values = [match.group(2).strip()]
+            for value in values:
+                if not value:
+                    continue
+                counters[category] += 1
+                if category == "variables" and "=" in value:
+                    key, value = value.split("=", 1)
+                    key = key.strip() or f"item_{counters[category]}"
+                    value = value.strip()
+                else:
+                    key = f"item_{counters[category]}"
+                if value:
+                    updates[category][key] = value
+        return {category: items for category, items in updates.items() if items}
+
+    def queue_text(self, text: str) -> bool:
+        """解析新文本并排队；可稍后在满足最小间隔时批量应用。"""
+        parsed = self.parse_updates(text)
+        changed = False
+        for category, entries in parsed.items():
+            bucket = self._pending_entries.setdefault(category, {})
+            for key, value in entries.items():
+                if self.entries.get(category, {}).get(key) != value:
+                    bucket[key] = value
+                    changed = True
+        self._has_new_info = self._has_new_info or changed
+        return changed
+
+    def apply_pending(self, step: int) -> int:
+        """满足更新间隔时批量写入结构化条目，返回实际更新数。"""
+        if not self.can_update(step):
+            return 0
+        written = 0
+        for category in self.CATEGORIES:
+            pending = self._pending_entries.get(category, {})
+            bucket = self.entries.setdefault(category, {})
+            for key, value in list(pending.items()):
+                if key in bucket or len(bucket) < self.capacity:
+                    bucket[key] = value
+                    del pending[key]
+                    written += 1
+            if not pending:
+                self._pending_entries.pop(category, None)
+        if written:
+            self._last_update_step = step
+        self._has_new_info = bool(self._pending_entries)
+        return written
 
     def render(self) -> str:
         lines = ["【思考记忆块】"]

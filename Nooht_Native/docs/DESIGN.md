@@ -4,6 +4,9 @@
 Mamba/注意力/MoE 层一行不改，只在外面加外层优化层，再微调。
 不需要预训练，不需要改模型结构。Native 主线默认关闭 Noild；显式配置并传入
 `noild_layer` 后，生成循环在模型 hidden states 与输出投影之间调用 vendored Noild。
+生成循环使用模型原生 `past_key_values`/`cache`（若模型支持），否则回退完整前缀前向。
+前向计算保留的是标准 Transformer 模型 cache；是否适用于具体 Jamba checkpoint 需端到端验证。
+本仓库不包含官方 Jamba 权重或 tokenizer；真实运行需调用方提供可访问的 checkpoint。
 
 ## 1. 多硬件后端（第三节 1）
 
@@ -26,14 +29,16 @@ Mamba/注意力/MoE 层一行不改，只在外面加外层优化层，再微调
 
 `native/protected_zone.py`：人设锚点 + 指令锚点 + 思考记忆块合并成同一机制。
 共同机制：不参与压缩、强制可见、固定位置（排到上下文末尾附近）、
-完整注意力层可直接读到。人设方案 A/B 对比见 `persona_anchor_ab.md`。
+完整注意力层可直接读到。思考文本按变量/约束/待办/结论标签解析；未标注句子
+作为独立结论项，按更新间隔批量写入。人设方案 A/B 对比见 `persona_anchor_ab.md`。
+PersonaAdapter 的 LoRA B 初始为零，未训练/未载入适配器时不应期待人设差异。
 
 ## 4. 复制机制（第三节 4）
 
-`native/copy_mechanism.py`：思考里写出内容后，输出阶段发复制区间指令
-`<copy:start-end>`，解码器逐字拷贝。Native 生成循环只从思考区解析指令，
-代码范围需 `<final>` 定稿标记。复制不纠错；KV 并行写入尚未实现。
-训练数据自动构造：`find_longest_overlap` 找最长逐字重合区间。
+`native/copy_mechanism.py`：模型生成 `<copy:start-end>` 指令后，Native 解码器
+从调用方提供的思考文本逐字拷贝对应区间；用户 prompt 中的指令不执行。
+代码范围需 `<final>` 定稿标记。复制不纠错；复制内容的 KV 写入与生成阶段的
+KV cache 目前未做并行融合。训练数据自动构造：`find_longest_overlap` 找最长重合区间。
 
 
 ## 5. 推理力度接口（第七节 5）

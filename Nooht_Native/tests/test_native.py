@@ -119,6 +119,20 @@ class TestProtectedZone(unittest.TestCase):
         with self.assertRaises(ValueError):
             block.edit_entry("unknown", "k", "v", step=10)
 
+    def test_thinking_memory_parses_structured_categories(self):
+        block = ThinkingMemoryBlock(min_interval=1)
+        changed = block.queue_text("变量: path=/tmp/x\n约束: 只输出 JSON\n待办: 检查输入\n结论: 路径有效")
+        self.assertTrue(changed)
+        self.assertEqual(block.apply_pending(0), 4)
+        self.assertEqual(block.entries["variables"]["path"], "/tmp/x")
+        self.assertIn("只输出 JSON", block.entries["constraints"].values())
+        self.assertIn("检查输入", block.entries["todos"].values())
+        self.assertIn("路径有效", block.entries["conclusions"].values())
+        sentence_block = ThinkingMemoryBlock(min_interval=1)
+        sentence_block.queue_text("第一条结论。第二条结论。")
+        sentence_block.apply_pending(0)
+        self.assertEqual(len(sentence_block.entries["conclusions"]), 2)
+
     def test_persona_adapter_is_hooked_into_model(self):
         model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
         adapter = PersonaAdapter(target_modules=["0"], rank=2, alpha=2)
@@ -171,25 +185,27 @@ class TestGeneration(unittest.TestCase):
             def decode(self, ids, skip_special_tokens=True):
                 return "".join(chr(int(i)) for i in ids.tolist())
 
-        class DummyModel(torch.nn.Module):
+        raw_thinking = "path=/tmp/a.txt"
+        from native.copy_mechanism import format_copy_instruction
+        instruction = format_copy_instruction(CopySpan(0, len(raw_thinking)))
+
+        class DirectiveModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.index = 0
             def forward(self, input_ids):
                 logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 128)
-                logits[..., ord("!")] = 1.0
+                char = instruction[self.index] if self.index < len(instruction) else "!"
+                logits[..., ord(char)] = 1.0
+                self.index += 1
                 return type("Output", (), {"logits": logits})()
 
-        cfg = NativeConfig(thinking_budget=3)
-        gen = NativeGenerator(DummyModel(), tokenizer=CharTokenizer(), config=cfg)
-        raw_thinking = "path=/tmp/a.txt"
-        span = CopySpan(0, len(raw_thinking))
-        from native.copy_mechanism import format_copy_instruction
-
-        thinking = raw_thinking + format_copy_instruction(span)
-        # 用户 prompt 中的指令不能触发复制；思考区的指令才会。
-        result = gen.generate("问题 <copy:0-15>", thinking_text=thinking, max_new_tokens=10)
-        self.assertTrue(result.text.startswith(raw_thinking))
+        cfg = NativeConfig(thinking_budget=len(instruction))
+        gen = NativeGenerator(DirectiveModel(), tokenizer=CharTokenizer(), config=cfg)
+        result = gen.generate("问题 <copy:0-15>", thinking_text=raw_thinking, max_new_tokens=64)
+        self.assertEqual(result.text, raw_thinking)  # 模型输出的指令被替换为来源原文
         self.assertEqual(result.copied_spans, 1)
-        self.assertEqual(result.steps, 3)
-        self.assertTrue(result.text.endswith("!!!"))
+        self.assertEqual(result.steps, len(instruction))
 
     def test_generate_requires_tokenizer_and_propagates_model_errors(self):
         def broken_model(**kwargs):
@@ -208,6 +224,64 @@ class TestGeneration(unittest.TestCase):
         gen = NativeGenerator(broken_model, tokenizer=Tokenizer())
         with self.assertRaisesRegex(ValueError, "model failure"):
             gen.generate("问题")
+
+    def test_generation_uses_incremental_kv_cache_when_available(self):
+        from types import SimpleNamespace
+
+        class Tokenizer:
+            eos_token_id = None
+            def __call__(self, text, return_tensors="pt"):
+                return {"input_ids": torch.tensor([[ord(c) % 128 for c in text]])}
+            def decode(self, ids, skip_special_tokens=True):
+                return "".join(chr(int(i)) for i in ids.tolist())
+
+        class CacheModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(1))
+                self.input_widths = []
+                self.past_flags = []
+            def forward(self, input_ids, use_cache=False, past_key_values=None):
+                self.input_widths.append(input_ids.shape[1])
+                self.past_flags.append(past_key_values is not None)
+                logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 128)
+                logits[..., ord("!")] = 1
+                return SimpleNamespace(logits=logits, past_key_values=(torch.tensor([1]),))
+
+        model = CacheModel()
+        gen = NativeGenerator(model, tokenizer=Tokenizer())
+        result = gen.generate("Q", max_new_tokens=3)
+        self.assertTrue(result.kv_cache_used)
+        self.assertEqual(model.input_widths, [1, 1, 1])
+        self.assertEqual(model.past_flags, [False, True, True])
+
+    def test_model_generated_copy_instruction_is_resolved_from_thinking(self):
+        class Tokenizer:
+            eos_token_id = None
+            def __init__(self, output): self.output, self.index = output, 0
+            def __call__(self, text, return_tensors="pt"):
+                return {"input_ids": torch.tensor([[1]])}
+            def decode(self, ids, skip_special_tokens=True):
+                return "".join(chr(int(i)) for i in ids.tolist())
+
+        source = "exact /tmp/path"
+        instruction = f"<copy:0-{len(source)}>"
+
+        class DirectiveModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__(); self.index = 0
+            def forward(self, input_ids):
+                logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 128)
+                char = instruction[self.index] if self.index < len(instruction) else "!"
+                logits[..., ord(char)] = 1
+                self.index += 1
+                return type("Output", (), {"logits": logits})()
+
+        tokenizer = Tokenizer(instruction)
+        gen = NativeGenerator(DirectiveModel(), tokenizer=tokenizer)
+        result = gen.generate("prompt", thinking_text=source, max_new_tokens=len(instruction))
+        self.assertEqual(result.text, source)
+        self.assertEqual(result.copied_spans, 1)
 
     def test_optional_noild_runs_between_hidden_states_and_lm_head(self):
         from types import SimpleNamespace
@@ -268,10 +342,10 @@ class TestGeneration(unittest.TestCase):
         gen = NativeGenerator(lambda **kwargs: None, tokenizer=CharTokenizer())
         code = "```py\nprint(1)\n```"
         start, end = code.index("print"), code.index("\n```")
-        source = code + f"<copy:{start}-{end}>"
+        instruction = f"<copy:{start}-{end}>"
         with self.assertRaisesRegex(ValueError, "未定稿"):
-            gen._validated_copies(source)
-        self.assertEqual(gen._validated_copies(source + "<final>"), ["print(1)"])
+            gen._render_model_copies(instruction, code)
+        self.assertEqual(gen._render_model_copies(instruction, code + "<final>"), ("print(1)", 1))
 
     def test_lumenoo_tiers(self):
         for tier in ("saga", "tale", "poem"):
