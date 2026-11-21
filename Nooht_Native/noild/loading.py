@@ -34,10 +34,11 @@ class ExpertHeatManager:
     unload_threshold: float = 0.05
     cooldown_steps: int = 10
     min_loaded: int = 1
+    preload_delay: int = 2  # 异步预加载延迟步数：路由后 N 步才标记加载完成
     heat: dict[str, float] = field(default_factory=dict)
     loaded: set[str] = field(default_factory=set)
     last_used_step: dict[str, int] = field(default_factory=dict)
-    pending_preload: deque = field(default_factory=deque)
+    pending_preload: deque = field(default_factory=deque)  # 元素: (expert_id, ready_step)
 
     def __post_init__(self):
         self.cold_start_all()
@@ -60,29 +61,46 @@ class ExpertHeatManager:
         for eid in self.loaded:
             self.heat.setdefault(eid, 1.0)
 
-    def register_route(self, domain_ids, step: int) -> list[str]:
-        """路由判出领域后：提升热度，并异步预加载对应垂直专家。
+    def _register_use(self, expert_id: str, step: int) -> bool:
+        self.heat[expert_id] = self.heat.get(expert_id, 0.0) + 1.0
+        self.last_used_step[expert_id] = step
+        pending_ids = {eid for eid, _ in self.pending_preload}
+        if expert_id not in self.loaded and expert_id not in pending_ids:
+            self.pending_preload.append((expert_id, step + self.preload_delay))
+            return True
+        return False
 
-        Returns:
-            新加入预加载队列的专家 id 列表。
-        """
+    def register_route(self, domain_ids, step: int) -> list[str]:
+        """路由判出领域后提升热度并预加载对应垂直专家。"""
         queued = []
-        for d in domain_ids:
-            eid = self.vertical_id(int(d))
-            self.heat[eid] = self.heat.get(eid, 0.0) + 1.0
-            self.last_used_step[eid] = step
-            if eid not in self.loaded and eid not in self.pending_preload:
-                self.pending_preload.append(eid)
-                queued.append(eid)
+        for domain in domain_ids:
+            expert_id = self.vertical_id(int(domain))
+            if self._register_use(expert_id, step):
+                queued.append(expert_id)
         return queued
 
-    def drain_preload(self) -> list[str]:
-        """模拟异步预加载完成：把队列中的专家标记为已加载。"""
+    def register_general_use(self, expert_index: int, step: int) -> bool:
+        """记录通用专家使用热度，并在已卸载时排队重新加载。"""
+        if not 0 <= expert_index < self.num_general:
+            raise IndexError(f"通用专家索引越界: {expert_index}")
+        return self._register_use(self.general_id(expert_index), step)
+
+    def drain_preload(self, current_step: int | None = None) -> list[str]:
+        """处理已到期的异步预加载：到期专家标记为已加载。
+
+        Args:
+            current_step: 当前步；为 None 时（兼容旧调用）直接完成全部队列。
+        """
         done = []
+        remaining = deque()
         while self.pending_preload:
-            eid = self.pending_preload.popleft()
-            self.loaded.add(eid)
-            done.append(eid)
+            eid, ready_step = self.pending_preload.popleft()
+            if current_step is None or ready_step <= current_step:
+                self.loaded.add(eid)
+                done.append(eid)
+            else:
+                remaining.append((eid, ready_step))
+        self.pending_preload = remaining
         return done
 
     def step(self, current_step: int) -> list[str]:

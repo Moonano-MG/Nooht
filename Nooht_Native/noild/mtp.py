@@ -26,7 +26,9 @@ class MTPHead(nn.Module):
         super().__init__()
         self.num_tokens = num_tokens
         self.vocab_size = vocab_size
+        # 方差保持初始化（与 experts.init_linear_ 一致，避免级联信号衰减）
         self.proj = nn.Linear(hidden_size, vocab_size * num_tokens, bias=False)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1.0 / (hidden_size**0.5))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         # hidden: (..., hidden_size) -> (..., num_tokens, vocab_size)

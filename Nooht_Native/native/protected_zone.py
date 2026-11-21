@@ -36,6 +36,7 @@ class PersonaAdapter(nn.Module):
         self.scaling = alpha / rank
         self.lora_A = nn.ParameterDict()
         self.lora_B = nn.ParameterDict()
+        self._name_to_key: dict[str, str] = {}
         self.active = False
 
     def register_targets(self, model: nn.Module) -> None:
@@ -44,14 +45,12 @@ class PersonaAdapter(nn.Module):
             if isinstance(module, nn.Linear) and any(
                 t in name for t in self.target_modules
             ):
-                if name not in self.lora_A:
-                    self.lora_A[name] = nn.Parameter(
-                        torch.empty(self.rank, module.in_features)
-                    )
-                    self.lora_B[name] = nn.Parameter(
-                        torch.zeros(module.out_features, self.rank)
-                    )
-                    nn.init.kaiming_uniform_(self.lora_A[name], a=5**0.5)
+                key = name.replace(".", "__dot__")
+                self._name_to_key[name] = key
+                if key not in self.lora_A:
+                    self.lora_A[key] = nn.Parameter(torch.empty(self.rank, module.in_features))
+                    self.lora_B[key] = nn.Parameter(torch.zeros(module.out_features, self.rank))
+                    nn.init.kaiming_uniform_(self.lora_A[key], a=5**0.5)
 
     def load(self) -> None:
         self.active = True
@@ -61,9 +60,10 @@ class PersonaAdapter(nn.Module):
 
     def delta(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """计算某层低秩增量；未激活或无此层时返回 0。"""
-        if not self.active or name not in self.lora_A:
+        key = self._name_to_key.get(name)
+        if not self.active or key is None:
             return torch.zeros_like(x)
-        return self.scaling * (x @ self.lora_A[name].T @ self.lora_B[name].T)
+        return self.scaling * (x @ self.lora_A[key].T @ self.lora_B[key].T)
 
 
 class PersonaSchemeA:

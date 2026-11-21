@@ -72,6 +72,7 @@ class RejudgeController:
         self.max_interval = config.router_rejudge_max_interval
         self.uncertainty_threshold = config.router_uncertainty_threshold
         self.topic_shift_threshold = config.router_topic_shift_threshold
+        self.max_entropy = max(float(torch.log(torch.tensor(config.num_domains))), 1e-9)
         self.last_rejudge_step: int = -10**9
         self.last_hidden: torch.Tensor | None = None
         self.current_interval: int = self.base_interval
@@ -99,7 +100,8 @@ class RejudgeController:
         # 不确定度突升：提前重判
         if entropy is not None:
             ent = float(entropy) if not isinstance(entropy, torch.Tensor) else float(entropy.mean())
-            if ent > self.uncertainty_threshold:
+            normalized_entropy = ent / self.max_entropy
+            if normalized_entropy > self.uncertainty_threshold:
                 return True, "uncertainty"
         # 话题转变：hidden 与上次路由 hidden 余弦漂移过大
         if hidden is not None and self.last_hidden is not None:

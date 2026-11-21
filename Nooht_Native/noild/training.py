@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -81,6 +83,93 @@ def upcycle_init(vertical_experts: nn.ModuleList, source_mlp: ExpertMLP) -> None
         mlp.gate_proj.weight.data.copy_(source_mlp.gate_proj.weight.data)
         mlp.up_proj.weight.data.copy_(source_mlp.up_proj.weight.data)
         mlp.down_proj.weight.data.copy_(source_mlp.down_proj.weight.data)
+
+
+def draft_loss(draft_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    """预生成专家训练 loss：草稿 token 的交叉熵。
+
+    draft_logits: (..., draft_num_tokens, vocab_size)
+    target_ids: (..., draft_num_tokens) 真实未来 token id。
+    训练时必须把此 loss 加入总 loss，否则 draft_head 梯度恒为 0。
+    """
+    return F.cross_entropy(
+        draft_logits.reshape(-1, draft_logits.shape[-1]),
+        target_ids.reshape(-1),
+    )
+
+
+def mtp_loss(mtp_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    """MTP 头训练 loss：未来 k 个 token 的交叉熵（与 draft_loss 同形）。
+
+    mtp_logits: (..., mtp_num_tokens, vocab_size)
+    target_ids: (..., mtp_num_tokens)
+    训练时必须加入总 loss，否则 mtp_head 梯度恒为 0。
+    """
+    return F.cross_entropy(
+        mtp_logits.reshape(-1, mtp_logits.shape[-1]),
+        target_ids.reshape(-1),
+    )
+
+
+def train_noild(
+    layer: NoildLayer,
+    lm_head: nn.Module,
+    batches: Iterable[Mapping[str, torch.Tensor]],
+    optimizer: torch.optim.Optimizer,
+    *,
+    draft_weight: float = 0.1,
+    mtp_weight: float = 0.1,
+    max_grad_norm: float | None = 1.0,
+) -> list[dict[str, float]]:
+    """在已由底座产生的 hidden states 上训练 Noild 与输出头。
+
+    每个 batch 必须包含 ``hidden``、``target_ids``；若级联路径启用 draft 或
+    general/MTP 阶段，还必须提供 ``draft_target_ids`` / ``mtp_target_ids``，
+    避免预测头在没有 loss 的情况下静默训练。返回逐步 loss 指标。
+    """
+    layer.train()
+    lm_head.train()
+    history: list[dict[str, float]] = []
+    for step, batch in enumerate(batches):
+        if "hidden" not in batch or "target_ids" not in batch:
+            raise KeyError("每个 batch 必须含 hidden 和 target_ids。")
+        hidden = batch["hidden"]
+        targets = batch["target_ids"]
+        optimizer.zero_grad(set_to_none=True)
+        output = layer(hidden, step=step)
+        logits = lm_head(output.hidden)
+        lm = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+        loss = lm
+        values = {"lm_loss": float(lm.detach())}
+        if output.draft_logits is not None:
+            if "draft_target_ids" not in batch:
+                raise KeyError("级联启用 draft 时需提供 draft_target_ids。")
+            aux = draft_loss(output.draft_logits, batch["draft_target_ids"])
+            loss = loss + draft_weight * aux
+            values["draft_loss"] = float(aux.detach())
+        if output.mtp_logits is not None:
+            if "mtp_target_ids" not in batch:
+                raise KeyError("级联启用 MTP 时需提供 mtp_target_ids。")
+            aux = mtp_loss(output.mtp_logits, batch["mtp_target_ids"])
+            loss = loss + mtp_weight * aux
+            values["mtp_loss"] = float(aux.detach())
+        balance = load_balance_loss(
+            output.router.domain_logits.reshape(-1, layer.config.num_domains),
+            layer.config.num_domains,
+            layer.config.load_balance_coef,
+        )
+        loss = loss + balance
+        loss.backward()
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None],
+                max_grad_norm,
+            )
+        optimizer.step()
+        values["load_balance_loss"] = float(balance.detach())
+        values["total_loss"] = float(loss.detach())
+        history.append(values)
+    return history
 
 
 def alignment_check(merge_expert, hidden: torch.Tensor) -> dict:

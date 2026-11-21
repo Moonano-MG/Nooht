@@ -16,9 +16,14 @@ from noild import (
     NoildConfig,
     NoildLayer,
     get_cascade_path,
+    draft_loss,
     load_balance_loss,
+    mtp_loss,
     set_trainable,
+    speculative_greedy_decode,
+    train_noild,
     upcycle_init,
+    verify_draft,
 )
 from noild.experts import ExpertMLP, MergeExpert
 from noild.loading import ExpertHeatManager
@@ -106,6 +111,117 @@ class TestLayer(unittest.TestCase):
         layer = NoildLayer(small_config(), path=get_cascade_path("veronoo", "duet"))
         out = layer(torch.randn(2, 8, 64))
         self.assertEqual(out.path_taken, ("router", "draft", "general"))
+
+    def test_inference_skips_unused_auxiliary_logits(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=("router", "draft", "general"), use_loading=False).eval()
+        out = layer(torch.randn(1, 4, cfg.hidden_size))
+        self.assertIsNone(out.draft_logits)
+        self.assertIsNone(out.mtp_logits)
+        train_out = layer(torch.randn(1, 4, cfg.hidden_size), return_aux_logits=True)
+        self.assertIsNotNone(train_out.draft_logits)
+        self.assertIsNotNone(train_out.mtp_logits)
+
+    def test_router_rejudge_cache_and_general_determinism(self):
+        cfg = small_config(router_rejudge_interval=2)
+        layer = NoildLayer(cfg, path=("router", "general"), use_loading=False).eval()
+        with torch.no_grad():
+            layer.router.weight.weight.zero_()
+            layer.router.weight.weight[0].fill_(2.0)
+        calls = 0
+        original = layer.router.judge_user_input
+
+        def counted(hidden):
+            nonlocal calls
+            calls += 1
+            return original(hidden)
+
+        layer.router.judge_user_input = counted
+        x = torch.ones(1, 4, cfg.hidden_size)
+        first = layer(x, step=0)
+        second = layer(x, step=1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(second.rejudge_reason, "cached")
+        self.assertTrue(torch.allclose(first.hidden, second.hidden))
+        third = layer(x, step=2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(third.rejudge_reason, "interval")
+        new_request = layer(x, step=0)
+        self.assertEqual(calls, 3)
+        self.assertEqual(new_request.rejudge_reason, "first")
+
+    def test_merge_window_tail_is_primary_passthrough(self):
+        cfg = small_config(merge_window_start=2, merge_window_max=2)
+        merge = MergeExpert(cfg)
+        primary = torch.randn(1, 6, cfg.hidden_size)
+        vertical_a = torch.randn_like(primary)
+        vertical_b = vertical_a.clone()
+        vertical_b[:, 2:, :] += 20
+        out_a = merge(primary, vertical_a, step=0)
+        out_b = merge(primary, vertical_b, step=0)
+        self.assertTrue(torch.equal(out_a[:, 2:, :], primary[:, 2:, :]))
+        self.assertTrue(torch.equal(out_a[:, 2:, :], out_b[:, 2:, :]))
+
+    def test_cascade_signal_and_auxiliary_head_gradients(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=("router", "draft", "general", "vertical", "merge"), use_loading=False)
+        x = torch.randn(2, 8, cfg.hidden_size, requires_grad=True)
+        out = layer(x)
+        ratio = float(out.hidden.detach().square().mean().sqrt() / x.detach().square().mean().sqrt())
+        self.assertGreater(ratio, 1e-3)
+        draft_targets = torch.randint(cfg.vocab_size, (2, 8, cfg.draft_num_tokens))
+        mtp_targets = torch.randint(cfg.vocab_size, (2, 8, cfg.mtp_num_tokens))
+        (draft_loss(out.draft_logits, draft_targets) + mtp_loss(out.mtp_logits, mtp_targets)).backward()
+        self.assertGreater(float(layer.draft.draft_head.weight.grad.abs().sum()), 0)
+        mtp_grad = sum(
+            float(expert.mtp_head.proj.weight.grad.abs().sum())
+            for expert in layer.generals
+            if expert.mtp_head.proj.weight.grad is not None
+        )
+        self.assertGreater(mtp_grad, 0)
+
+    def test_speculative_prefix_verification(self):
+        accepted, rate = verify_draft(torch.tensor([4, 7, 3, 8]), torch.tensor([4, 7, 5, 8]))
+        self.assertEqual(accepted, 2)
+        self.assertEqual(rate, 0.5)
+
+    def test_speculative_decode_accepts_verified_tokens(self):
+        def logits_for(ids):
+            return torch.zeros(*ids.shape, 16)
+
+        def draft_fn(ids):
+            positions = torch.arange(ids.shape[1] + 1, ids.shape[1] + 4).view(1, 3)
+            logits = logits_for(positions)
+            logits.scatter_(2, positions.unsqueeze(-1), 1.0)
+            return logits
+
+        def target_fn(ids):
+            positions = torch.arange(2, ids.shape[1] + 2).view(1, -1)
+            logits = logits_for(ids)
+            logits.scatter_(2, positions.unsqueeze(-1), 1.0)
+            return logits
+
+        output, metrics = speculative_greedy_decode(torch.tensor([[1]]), draft_fn, target_fn, 5)
+        self.assertEqual(output.tolist(), [[1, 2, 3, 4, 5, 6]])
+        self.assertEqual(metrics["acceptance_rate"], 1.0)
+
+    def test_train_noild_requires_and_uses_auxiliary_targets(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=("router", "draft", "general", "vertical", "merge"), use_loading=False)
+        head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size)
+        optimizer = torch.optim.AdamW(list(layer.parameters()) + list(head.parameters()), lr=1e-3)
+        batch_size, seq = 2, 4
+        batch = {
+            "hidden": torch.randn(batch_size, seq, cfg.hidden_size),
+            "target_ids": torch.randint(cfg.vocab_size, (batch_size, seq)),
+            "draft_target_ids": torch.randint(cfg.vocab_size, (batch_size, seq, cfg.draft_num_tokens)),
+            "mtp_target_ids": torch.randint(cfg.vocab_size, (batch_size, seq, cfg.mtp_num_tokens)),
+        }
+        history = train_noild(layer, head, [batch], optimizer)
+        self.assertIn("draft_loss", history[0])
+        self.assertIn("mtp_loss", history[0])
+        with self.assertRaisesRegex(KeyError, "draft_target_ids"):
+            train_noild(layer, head, [{k: v for k, v in batch.items() if k != "draft_target_ids"}], optimizer)
 
     def test_merge_both_sources(self):
         merge = MergeExpert(small_config())
