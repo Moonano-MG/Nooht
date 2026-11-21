@@ -40,7 +40,7 @@ class NoildConfig:
     # 路由重判节奏：生成中每 N 个 token 重判一次
     router_rejudge_interval: int = 16  # 基础 N
     router_rejudge_max_interval: int = 64  # 负载大时扩大 N 的上限
-    router_uncertainty_threshold: float = 0.9  # 熵超过此值提前重判
+    router_uncertainty_threshold: float = 0.9  # 归一化熵超过此值提前重判（0~1）
     router_topic_shift_threshold: float = 0.5  # 与上次路由 hidden 余弦漂移超过此值提前重判
 
     # 训练：负载约束，防止垂直专家被饿死

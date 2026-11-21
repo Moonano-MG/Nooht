@@ -46,8 +46,9 @@ def _has_rocm() -> bool:
 
 
 def _has_xla() -> bool:
+    """检测 PyTorch/XLA（安装 JAX 本身不代表 PyTorch 能用 XLA）。"""
     try:
-        import jax  # noqa: F401
+        import torch_xla  # noqa: F401
         return True
     except Exception:
         return False
@@ -64,7 +65,7 @@ def _has_oneapi() -> bool:
 def detect_backend() -> Backend:
     """按优先级 CUDA > ROCm > XLA > oneAPI 检测，缺省 CPU 回退。"""
     if _has_rocm():
-        return Backend.ROCm
+        return Backend.ROCM
     if _has_cuda():
         return Backend.CUDA
     if _has_xla():
@@ -121,7 +122,7 @@ def gated_delta_reference(x: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     outs = []
     for t in range(L):
         # delta 规则简化：state = state + beta * (x_t - state)
-        state = state + beta[..., t, :].squeeze(-1) * (x[..., t, :] - state)
+        state = state + beta[..., t, :] * (x[..., t, :] - state)
         outs.append(state)
     return torch.stack(outs, dim=-2)
 
@@ -142,43 +143,53 @@ def run_op(op: str, backend: Backend, *args, **kwargs) -> torch.Tensor:
     return _OP_REFERENCES[op](*args, **kwargs)
 
 
+def _sample_inputs(op: str, device: str, sequence: int = 4):
+    x = torch.randn(2, sequence, 8, device=device)
+    if op == "selective_scan":
+        return (x, torch.rand_like(x) * 0.1, -torch.rand(8, device=device),
+                torch.randn_like(x), torch.randn_like(x))
+    if op == "gated_delta":
+        return (x, torch.rand(2, sequence, 1, device=device))
+    raise KeyError(f"未知算子: {op!r}")
+
+
 def check_correctness(backend: Backend, op: str = "selective_scan",
                       device: str = "cpu") -> dict:
-    """前向/反向正确性测试：后端实现 vs 参考实现（本阶段均为参考实现自检）。
-
-    Returns:
-        报告 dict：backend/op/forward_ok/backward_ok/max_abs_diff。
-    """
+    """比较注册后端 kernel 与纯 PyTorch 参考实现的前向/反向结果。"""
     torch.manual_seed(0)
-    x = torch.randn(2, 4, 8, device=device, requires_grad=True)
-    dt = torch.rand(2, 4, 8, device=device) * 0.1
-    A = -torch.rand(8, device=device)
-    B = torch.randn(2, 4, 8, device=device)
-    C = torch.randn(2, 4, 8, device=device)
-    ref = run_op(op, backend, x, dt, A, B, C)
-    loss = ref.sum()
-    loss.backward()
-    grad_ok = x.grad is not None and bool(torch.isfinite(x.grad).all())
+    inputs = _sample_inputs(op, device)
+    ref_inputs = tuple(t.detach().clone().requires_grad_(i == 0) for i, t in enumerate(inputs))
+    test_inputs = tuple(t.detach().clone().requires_grad_(i == 0) for i, t in enumerate(inputs))
+    ref = _OP_REFERENCES[op](*ref_inputs)
+    actual = run_op(op, backend, *test_inputs)
+    max_abs_diff = float((actual.detach() - ref.detach()).abs().max())
+    ref.sum().backward()
+    actual.sum().backward()
+    ref_grad, test_grad = ref_inputs[0].grad, test_inputs[0].grad
+    backward_ok = (
+        ref_grad is not None and test_grad is not None
+        and bool(torch.isfinite(ref_grad).all()) and bool(torch.isfinite(test_grad).all())
+        and bool(torch.allclose(ref_grad, test_grad, atol=1e-5, rtol=1e-4))
+    )
     return {
         "backend": backend.value,
         "op": op,
-        "forward_ok": bool(torch.isfinite(ref).all()),
-        "backward_ok": grad_ok,
-        "max_abs_diff": 0.0,  # 回退路径与参考实现一致；注册 kernel 后在此对比
+        "forward_ok": bool(torch.isfinite(actual).all()) and bool(torch.allclose(actual, ref, atol=1e-5, rtol=1e-4)),
+        "backward_ok": backward_ok,
+        "max_abs_diff": max_abs_diff,
     }
 
 
 def benchmark(backend: Backend, op: str = "selective_scan", steps: int = 5) -> dict:
-    """记录基础性能（仅参考实现耗时，深度优化后另行记录）。"""
+    """记录指定后端算子的基础耗时。"""
+    if steps <= 0:
+        raise ValueError("steps 必须为正整数")
     torch.manual_seed(0)
-    x = torch.randn(2, 16, 8)
-    dt = torch.rand(2, 16, 8) * 0.1
-    A = -torch.rand(8)
-    B = torch.randn(2, 16, 8)
-    C = torch.randn(2, 16, 8)
-    run_op(op, backend, x, dt, A, B, C)  # warmup
+    device = "cuda" if backend in (Backend.CUDA, Backend.ROCM) and torch.cuda.is_available() else "cpu"
+    args = _sample_inputs(op, device, sequence=16)
+    run_op(op, backend, *args)  # warmup
     t0 = time.perf_counter()
     for _ in range(steps):
-        run_op(op, backend, x, dt, A, B, C)
+        run_op(op, backend, *args)
     elapsed = (time.perf_counter() - t0) / steps
     return {"backend": backend.value, "op": op, "avg_seconds": elapsed, "steps": steps}

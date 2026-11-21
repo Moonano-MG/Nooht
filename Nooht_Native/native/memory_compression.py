@@ -82,6 +82,36 @@ class ScoringHead(nn.Module):
         return self.net(segment_hidden).squeeze(-1)
 
 
+def extractive_summary(text: str, max_chars: int | None = None) -> str:
+    """确定性抽取式摘要：选取高信息密度完整短语，不把原文机械截断。
+
+    这是无生成模型依赖的规则摘要，不宣称具备语义生成能力。优先保留
+    含数字、路径、引号内容或关键因果词的分句，并按原顺序拼接。
+    """
+    budget = max_chars or max(24, min(160, len(text) // 3))
+    clauses = [c.strip() for c in re.split(r"(?<=[。！？.!?；;])|[,，、]", text) if c.strip()]
+    if not clauses:
+        return "【摘要】" + text
+    markers = re.compile(r"\d|/|\\|https?://|[=:]|必须|因此|因为|结论|重要|错误|不要|不能")
+    ranked = sorted(
+        enumerate(clauses),
+        key=lambda item: (bool(markers.search(item[1])), min(len(item[1]), 120), -item[0]),
+        reverse=True,
+    )
+    selected = []
+    used = 0
+    for _, clause in ranked:
+        addition = len(clause) + (1 if selected else 0)
+        if used + addition <= budget:
+            selected.append(clause)
+            used += addition
+    if not selected:
+        # 没有可抽取的完整短语时，至少给出显式摘要标记和信息词，而非截取前缀。
+        tokens = re.findall(r"[A-Za-z0-9_./:-]+|[\u4e00-\u9fff]{2,}", text)
+        selected = tokens[: max(1, budget // 8)] or ["内容过长"]
+    return "【摘要】" + "；".join(selected)
+
+
 class SelectiveMemoryCompressor:
     """选择性记忆压缩器：只处理输入上下文，不碰模型内部状态。"""
 
@@ -132,7 +162,7 @@ class SelectiveMemoryCompressor:
             if seg.protected:
                 out.append(seg)
             elif seg.score < self.low_score_threshold:
-                summary = seg.summary or f"[摘要: {seg.text[:40]}…]"
+                summary = seg.summary or extractive_summary(seg.text)
                 out.append(Segment(text=summary, score=seg.score, protected=False))
             else:
                 out.append(seg)

@@ -17,11 +17,19 @@ from .layer import NoildLayer, NoildOutput
 from .loading import ExpertHeatManager
 from .mtp import MTPHead, build_mtp_head
 from .router import DomainRouter, RejudgeController, RouterOutput
+from .speculative import (
+    draft_acceptance_rate,
+    speculative_greedy_decode,
+    verify_draft,
+)
 from .training import (
     STAGED_TRAINING_PLAN,
     alignment_check,
+    draft_loss,
     load_balance_loss,
+    mtp_loss,
     set_trainable,
+    train_noild,
     upcycle_init,
 )
 
@@ -46,9 +54,15 @@ __all__ = [
     "RouterOutput",
     "STAGED_TRAINING_PLAN",
     "alignment_check",
+    "draft_loss",
     "load_balance_loss",
+    "mtp_loss",
     "set_trainable",
+    "train_noild",
     "upcycle_init",
+    "draft_acceptance_rate",
+    "speculative_greedy_decode",
+    "verify_draft",
 ]
 
 __version__ = "0.1.0.dev0"
