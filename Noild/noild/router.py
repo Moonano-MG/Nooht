@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -72,8 +73,10 @@ class RejudgeController:
         self.max_interval = config.router_rejudge_max_interval
         self.uncertainty_threshold = config.router_uncertainty_threshold
         self.topic_shift_threshold = config.router_topic_shift_threshold
-        self.max_entropy = max(float(torch.log(torch.tensor(config.num_domains))), 1e-9)
+        # Python math 保持该控制器可在 meta 初始化/参数量统计期间构造。
+        self.max_entropy = max(math.log(config.num_domains), 1e-9)
         self.last_rejudge_step: int = -10**9
+        self.last_uncertainty_rejudge_step: int = -10**9
         self.last_hidden: torch.Tensor | None = None
         self.current_interval: int = self.base_interval
 
@@ -101,7 +104,13 @@ class RejudgeController:
         if entropy is not None:
             ent = float(entropy) if not isinstance(entropy, torch.Tensor) else float(entropy.mean())
             normalized_entropy = ent / self.max_entropy
-            if normalized_entropy > self.uncertainty_threshold:
+            # High-entropy random/untrained routers can remain uncertain forever.
+            # Throttle repeated early rejudges; normal interval/topic-shift still applies.
+            uncertainty_ready = (
+                step - self.last_uncertainty_rejudge_step >= self.current_interval
+            )
+            if normalized_entropy > self.uncertainty_threshold and uncertainty_ready:
+                self.last_uncertainty_rejudge_step = step
                 return True, "uncertainty"
         # 话题转变：hidden 与上次路由 hidden 余弦漂移过大
         if hidden is not None and self.last_hidden is not None:

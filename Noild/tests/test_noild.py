@@ -150,6 +150,30 @@ class TestLayer(unittest.TestCase):
         self.assertEqual(calls, 3)
         self.assertEqual(new_request.rejudge_reason, "first")
 
+    def test_uncertain_untrained_router_is_throttled(self):
+        cfg = small_config(router_rejudge_interval=4)
+        layer = NoildLayer(cfg, path=("router",), use_loading=False).eval()
+        with torch.no_grad():
+            layer.router.weight.weight.zero_()  # exactly uniform, max normalized entropy
+        calls = 0
+        original = layer.router.judge_user_input
+        def counted(hidden):
+            nonlocal calls
+            calls += 1
+            return original(hidden)
+        layer.router.judge_user_input = counted
+        x = torch.ones(1, 1, cfg.hidden_size)
+        for step in range(50):
+            layer(x, step=step)
+        self.assertLess(calls, 20)  # 不会因高熵每个 token 重判
+        self.assertGreater(calls, 1)
+
+    def test_repeated_general_stages_select_distinct_experts(self):
+        layer = NoildLayer(small_config(num_general_experts=2), path=("router", "general", "general"), use_loading=False)
+        self.assertIsNot(layer._general_for_domain(0, 0), layer._general_for_domain(0, 1))
+        out = layer(torch.randn(1, 3, 64))
+        self.assertIsNotNone(out.mtp_logits)
+
     def test_merge_window_tail_is_primary_passthrough(self):
         cfg = small_config(merge_window_start=2, merge_window_max=2)
         merge = MergeExpert(cfg)
@@ -201,9 +225,53 @@ class TestLayer(unittest.TestCase):
             logits.scatter_(2, positions.unsqueeze(-1), 1.0)
             return logits
 
-        output, metrics = speculative_greedy_decode(torch.tensor([[1]]), draft_fn, target_fn, 5)
+        output, metrics = speculative_greedy_decode(
+            torch.tensor([[1]]), draft_fn, target_fn, 5,
+            draft_num_tokens=3, draft_output_mode="future",
+        )
         self.assertEqual(output.tolist(), [[1, 2, 3, 4, 5, 6]])
         self.assertEqual(metrics["acceptance_rate"], 1.0)
+
+    def test_speculative_causal_output_uses_last_position_only(self):
+        def causal_fn(ids):
+            logits = torch.zeros(1, ids.shape[1], 16)
+            for position in range(ids.shape[1]):
+                logits[:, position, position + 2] = 10
+            return logits
+
+        output, metrics = speculative_greedy_decode(
+            torch.tensor([[1]]), causal_fn, causal_fn, 4,
+            draft_num_tokens=3, draft_output_mode="causal",
+        )
+        self.assertEqual(output.tolist(), [[1, 2, 3, 4, 5]])
+        self.assertEqual(metrics["acceptance_rate"], 1.0)
+
+    def test_speculative_accepts_noild_four_dimensional_draft_logits(self):
+        def noild_style_draft(ids):
+            seq = ids.shape[1]
+            # draft logits: (batch, sequence, K, vocab), future tokens are seq+1 .. seq+2
+            logits = torch.zeros(1, seq, 2, 32)
+            logits[:, -1, 0, seq + 1] = 1
+            logits[:, -1, 1, seq + 2] = 1
+            return logits
+
+        def target(ids):
+            logits = torch.zeros(1, ids.shape[1], 32)
+            for pos in range(ids.shape[1]):
+                logits[:, pos, pos + 2] = 1
+            return logits
+
+        output, metrics = speculative_greedy_decode(
+            torch.tensor([[1]]), noild_style_draft, target, 3,
+            draft_num_tokens=2, draft_output_mode="future",
+        )
+        self.assertEqual(output.tolist(), [[1, 2, 3, 4]])
+        self.assertEqual(metrics["acceptance_rate"], 1.0)
+
+    def test_noild_layer_constructs_on_meta_device(self):
+        with torch.device("meta"):
+            layer = NoildLayer(small_config())
+        self.assertEqual(layer.router.weight.weight.device.type, "meta")
 
     def test_train_noild_requires_and_uses_auxiliary_targets(self):
         cfg = small_config()
