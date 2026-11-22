@@ -82,6 +82,43 @@ class ScoringHead(nn.Module):
         return self.net(segment_hidden).squeeze(-1)
 
 
+def fit_scoring_head(
+    scoring_head: ScoringHead,
+    segment_hidden: torch.Tensor,
+    importance_targets: torch.Tensor,
+    *,
+    steps: int = 100,
+    learning_rate: float = 1e-3,
+) -> list[float]:
+    """在调用方提供的真实 pooled hidden/人工或任务标签上拟合打分头。"""
+    if steps <= 0 or learning_rate <= 0:
+        raise ValueError("steps 和 learning_rate 必须为正数。")
+    if segment_hidden.ndim != 2 or importance_targets.ndim != 1:
+        raise ValueError("特征需为二维张量，重要性标签需为一维张量。")
+    if segment_hidden.shape[0] != importance_targets.shape[0] or not segment_hidden.shape[0]:
+        raise ValueError("特征与标签的样本数必须相同且非零。")
+    if segment_hidden.shape[1] != scoring_head.net[0].in_features:
+        raise ValueError("特征 hidden_size 与 ScoringHead 不匹配。")
+    if bool(((importance_targets < 0) | (importance_targets > 1)).any()):
+        raise ValueError("importance_targets 必须位于 [0, 1]。")
+    parameter = next(scoring_head.parameters())
+    features = segment_hidden.to(device=parameter.device, dtype=parameter.dtype)
+    targets = importance_targets.to(device=parameter.device, dtype=parameter.dtype)
+    optimizer = torch.optim.AdamW(scoring_head.parameters(), lr=learning_rate)
+    scoring_head.train()
+    losses = []
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        predictions = scoring_head(features)
+        loss = torch.nn.functional.binary_cross_entropy(predictions, targets)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach()))
+    scoring_head.trained = True
+    scoring_head.eval()
+    return losses
+
+
 def extractive_summary(text: str, max_chars: int | None = None) -> str:
     """确定性抽取式摘要：选取高信息密度完整短语，不把原文机械截断。
 
@@ -136,14 +173,27 @@ class SelectiveMemoryCompressor:
             return False
         return current_len >= self.threshold_ratio * self.max_context_len
 
-    def score_segments(self, segments: list[Segment]) -> list[Segment]:
-        """打分：辅助打分头（已训练时）+ 规则兜底。"""
-        if self.scoring_head is not None and self.scoring_head.trained:
-            # 训练后的打分头路径：此处用文本长度作占位特征，真实接入时替换为 hidden
-            feats = torch.tensor(
-                [[min(len(s.text), 1000) / 1000.0] * 256 for s in segments],
-                dtype=torch.float32,
-            )
+    def score_segments(
+        self, segments: list[Segment], segment_hidden: torch.Tensor | None = None
+    ) -> list[Segment]:
+        """用已训练 head 和真实片段特征打分，否则明确回退规则评分。
+
+        不再把文本长度复制成伪 hidden 特征；调用方要使用训练 head，必须传入
+        与片段一一对应的真实 pooled hidden states。
+        """
+        use_head = (
+            self.scoring_head is not None
+            and self.scoring_head.trained
+            and segment_hidden is not None
+        )
+        if use_head:
+            if segment_hidden.ndim != 2 or segment_hidden.shape[0] != len(segments):
+                raise ValueError("segment_hidden 必须为 (片段数, hidden_size)。")
+            expected = self.scoring_head.net[0].in_features
+            if segment_hidden.shape[1] != expected:
+                raise ValueError(f"segment_hidden hidden_size 应为 {expected}。")
+            parameter = next(self.scoring_head.parameters())
+            feats = segment_hidden.to(device=parameter.device, dtype=parameter.dtype)
             with torch.no_grad():
                 scores = self.scoring_head(feats).tolist()
         else:
@@ -152,11 +202,13 @@ class SelectiveMemoryCompressor:
             seg.score = float(sc)
         return segments
 
-    def compress(self, segments: list[Segment]) -> list[Segment]:
+    def compress(
+        self, segments: list[Segment], segment_hidden: torch.Tensor | None = None
+    ) -> list[Segment]:
         """低分片段换成摘要或降权；受保护区不参与压缩。"""
         if not self.enabled:
             return segments
-        self.score_segments(segments)
+        self.score_segments(segments, segment_hidden=segment_hidden)
         out = []
         for seg in segments:
             if seg.protected:

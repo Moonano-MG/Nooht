@@ -28,8 +28,10 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 
 ## 加载策略（基础版）
 
-默认冷启动全量加载，再按热度卸载冷门专家；路由判出领域后异步预加载垂直专家。
-见 `noild.loading.ExpertHeatManager`。深度优化不在本阶段范围。
+默认冷启动全量加载，再按热度管理冷门专家。`ExpertHeatManager` 默认只做状态/热度调度；
+实际搬运可由 `NoildLayer(..., offload_device="cpu")` 在 `eval()` + `no_grad()` 推理时执行，或由调用方同时
+传入 `preload_expert`/`unload_expert` 回调。搬运任务在线程池串行执行，专家前向前等待加载完成。
+默认未配置搬运时只更新状态，不发生物理搬运，也不节省显存。
 
 ## 训练方式
 
@@ -43,8 +45,8 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 
 ## 适用范围
 
-专家拆分后每个更小，Noild 不建议用于约 30B 以下的模型；
-小规模只用于验证分工是否有效。
+生产部署时，专家拆分后容量更小，Noild 不建议用于约 30B 以下的模型。
+小模型仅用于研究性验证分工与实现流程，不代表可部署能力、质量验收或低参数档支持。
 
 ## 目录
 

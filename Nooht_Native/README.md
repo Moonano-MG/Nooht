@@ -11,7 +11,7 @@ Nooht_Native/
 ├── modeling_jamba.py / modular_jamba.py / configuration_jamba.py  # Jamba 底座（一行不改）
 ├── noild/                  # Noild vendored 副本（同源于 ../Noild/noild，见 docs/noild_in_native.md）
 ├── native/                 # 外层优化层（任务包第三节）
-│   ├── backend.py          # 多硬件后端 CUDA > ROCm > XLA > oneAPI
+│   ├── backend.py          # 后端检测/参考算子/注册接口；默认无优化 kernel
 │   ├── memory_compression.py # 选择性记忆压缩
 │   ├── protected_zone.py   # 受保护区（人设/指令/思考记忆块）
 │   ├── copy_mechanism.py   # 复制机制（格式与接口）
@@ -27,6 +27,16 @@ Nooht_Native/
 
 Lumenoo 没有专家路径之分，三档按底座/LoRA 规格划分：
 Saga（Max）、Tale（Plus）、Poem（Flash）。命名：`Lumenoo-Saga-xxB` 形式。
+
+## LoRA 微调
+
+`native.lora.attach_lora` 可在显式指定并核实的 Jamba 模块名上创建 PEFT LoRA；
+`native.lora.train_causal_lm_steps` 提供调用方数据上的基本 causal-LM 训练循环。
+`training/train_native.py` 的非 dry-run 模式要求显式传入 checkpoint、JSONL 数据
+（每行含 `text`）、LoRA target module 和输出目录。请安装 `peft`，并自行核实
+checkpoint 与 target module；仓库不含真实 Jamba 权重，也不自动下载或训练。
+
+该实现补充了训练入口，不代表真实 checkpoint 上的训练/质量验收已完成。
 
 ## 测试
 

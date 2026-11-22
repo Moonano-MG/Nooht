@@ -135,8 +135,17 @@ def speculative_greedy_decode(
             raise ValueError("target_fn logits 序列长度不足以验证全部草稿 token。")
         target_ids = target_logits[:, start:needed, :].argmax(dim=-1)
         count, _ = verify_draft(draft_ids[0], target_ids[0])
+        stop_on_draft_eos = False
+        if eos_token_id is not None and count:
+            eos_positions = (draft_ids[0, :count] == eos_token_id).nonzero(as_tuple=False)
+            if eos_positions.numel():
+                count = int(eos_positions[0, 0]) + 1
+                stop_on_draft_eos = True
         proposed += draft_ids.shape[1]
         accepted_total += count
+        if stop_on_draft_eos:
+            result = torch.cat((result, draft_ids[:, :count]), dim=1)
+            break
         if count < draft_ids.shape[1]:
             correction = target_ids[:, count : count + 1]
             result = torch.cat((result, draft_ids[:, :count], correction), dim=1)
