@@ -1,0 +1,87 @@
+name: train-noild
+
+# Same-budget pair training, Noild side (Jamba with 2 MoE blocks replaced by NoildLayer).
+# Only one run at a time: a newly dispatched run cancels the older in-progress run.
+# Hard limit: job timeout 60 min; the script also stops training after --max_minutes (45).
+
+on:
+  push:
+    branches: [v0.1.0-dev, arena/9241b18b-nooht]
+    paths:
+      - "scripts/pair_train/**"
+      - ".github/workflows/train-noild.yml"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "training steps (same value must be used for train-native)"
+        required: false
+        default: "2000"
+      seed:
+        description: "random seed"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train-noild
+  cancel-in-progress: true
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      STEPS: ${{ inputs.steps || '2000' }}
+      SEED: ${{ inputs.seed || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install "transformers==5.24.0"
+
+      - name: Build corpus (runtime, not committed)
+        run: python scripts/pair_train/build_corpus.py --out train-out/corpus.bin
+
+      - name: Train Noild
+        run: |
+          set -o pipefail
+          python -W ignore scripts/pair_train/train.py \
+            --arch noild --seed "$SEED" --steps "$STEPS" --eval_every 100 \
+            --corpus train-out/corpus.bin --threads "$(nproc)" --max_minutes 45 \
+            --out train-out/res_noild_s${SEED}.json 2>&1 | tee train-out/log_noild_s${SEED}.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json
+          files = glob.glob("train-out/res_noild_*.json")
+          if not files:
+              print("### Noild training: no result file was produced")
+          for f in files:
+              r = json.load(open(f))
+              print("### Noild training")
+              print(f"- status: {r['status']}, steps_done: {r['steps_done']}/{r['steps_requested']}")
+              print(f"- params: {r['params']}, wall_s: {r['wall_s']}")
+              print(f"- final val_loss: {r['final_val']}, best val_loss: {r['best_val']} @ step {r['best_step']}")
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-noild-seed${{ env.SEED }}
+          path: |
+            train-out/res_noild_*.json
+            train-out/log_noild_*.txt
+          if-no-files-found: warn
+          retention-days: 14
