@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 
 from native import backend as backend_module
-from native.backend import Backend, benchmark, check_correctness, detect_backend
+from native.backend import Backend, backend_status, benchmark, check_correctness, detect_backend
 from native.config import NativeConfig, lumenoo_config
 from native.copy_mechanism import (
     CopyDecoder,
@@ -21,10 +21,13 @@ from native.copy_mechanism import (
     find_longest_overlap,
 )
 from native.generation import NativeGenerator
+from native.lora import train_causal_lm_steps
 from noild import NoildConfig, NoildLayer
 from native.memory_compression import (
     Segment,
     SelectiveMemoryCompressor,
+    ScoringHead,
+    fit_scoring_head,
     split_segments,
 )
 from native.protected_zone import (
@@ -49,6 +52,12 @@ class TestBackend(unittest.TestCase):
         finally:
             backend_module._has_rocm = original_rocm
             backend_module._has_cuda = original_cuda
+
+    def test_backend_status_distinguishes_detection_from_kernels(self):
+        status = backend_status(Backend.CPU)
+        self.assertTrue(status["detected"])
+        self.assertFalse(status["all_optimized"])
+        self.assertEqual(set(status["operators"].values()), {"reference_fallback"})
 
     def test_correctness_and_benchmark(self):
         report = check_correctness(Backend.CPU)
@@ -83,6 +92,24 @@ class TestMemoryCompression(unittest.TestCase):
         report = comp.ablation(segs)
         self.assertIn("saved_ratio", report)
 
+    def test_scoring_head_trains_on_real_features_and_requires_them_at_inference(self):
+        head = ScoringHead(hidden_size=8)
+        comp = SelectiveMemoryCompressor(scoring_head=head, low_score_threshold=0.5)
+        segments = [Segment("important"), Segment("less important")]
+        # An untrained head falls back to rules; it never fabricates hidden vectors.
+        before = [s.score for s in comp.score_segments(segments)]
+        self.assertEqual(len(before), 2)
+        self.assertFalse(head.trained)
+        features = torch.randn(2, 8)
+        targets = torch.tensor([1.0, 0.0])
+        losses = fit_scoring_head(head, features, targets, steps=3)
+        self.assertEqual(len(losses), 3)
+        self.assertTrue(head.trained)
+        with self.assertRaisesRegex(ValueError, "segment_hidden"):
+            comp.score_segments(segments, torch.randn(1, 8))
+        scored = comp.score_segments(segments, features)
+        self.assertEqual(len(scored), 2)
+
     def test_extractive_summary_uses_complete_information_units(self):
         from native.memory_compression import extractive_summary
         text = "旧背景描述很长很长很长很长很长很长很长很长。错误码 E42 必须修复 /tmp/data.json。"
@@ -105,6 +132,20 @@ class TestProtectedZone(unittest.TestCase):
         self.assertIn("硬约束", text)
         self.assertTrue(zone.instruction.should_reinject(2))
         self.assertTrue(zone.is_protected_text(text))
+
+    def test_protected_zone_marks_anchor_segments_before_compression(self):
+        zone = ProtectedZone()
+        segments = [
+            Segment("ordinary context"),
+            Segment("【硬约束】只输出 JSON"),
+            Segment("【思考记忆块】"),
+            Segment("- constraints/format: JSON"),
+        ]
+        zone.protect_segments(segments)
+        self.assertFalse(segments[0].protected)
+        self.assertTrue(segments[1].protected)
+        self.assertTrue(segments[2].protected)
+        self.assertTrue(segments[3].protected)
 
     def test_thinking_memory_incremental_only(self):
         block = ThinkingMemoryBlock(capacity=2, min_interval=2)
@@ -147,6 +188,17 @@ class TestProtectedZone(unittest.TestCase):
         self.assertFalse(torch.allclose(baseline, adapted))
         adapter.unload()
         self.assertTrue(torch.allclose(baseline, model(x)))
+
+    def test_persona_adapter_casts_to_activation_dtype(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).double()
+        adapter = PersonaAdapter(target_modules=["0"], rank=2, alpha=2)
+        NativeGenerator(model, persona_adapter=adapter)
+        key = adapter._name_to_key["0"]
+        with torch.no_grad():
+            adapter.lora_B[key].fill_(0.25)
+        adapter.load()
+        result = model(torch.randn(2, 4, dtype=torch.float64))
+        self.assertEqual(result.dtype, torch.float64)
 
 
 class TestCopyMechanism(unittest.TestCase):
@@ -353,6 +405,32 @@ class TestGeneration(unittest.TestCase):
             self.assertEqual(cfg.tier, tier)
         with self.assertRaises(ValueError):
             NativeConfig(tier="unknown")
+
+
+class TestNativeLoraTraining(unittest.TestCase):
+    def test_causal_lm_step_updates_trainable_model(self):
+        from types import SimpleNamespace
+
+        class TinyLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(16, 8)
+                self.head = torch.nn.Linear(8, 16)
+            def forward(self, input_ids, attention_mask=None):
+                return SimpleNamespace(logits=self.head(self.embedding(input_ids)))
+
+        model = TinyLM()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        batch = {"input_ids": torch.tensor([[1, 2, 3, 4]])}
+        before = model.head.weight.detach().clone()
+        history = train_causal_lm_steps(
+            model, [batch, batch, batch], optimizer, max_steps=3,
+            gradient_accumulation_steps=2,
+        )
+        self.assertEqual(len(history), 3)
+        self.assertEqual(history[-1]["optimizer_steps"], 2.0)
+        self.assertTrue(torch.isfinite(torch.tensor(history[0]["loss"])))
+        self.assertFalse(torch.equal(before, model.head.weight.detach()))
 
 
 if __name__ == "__main__":

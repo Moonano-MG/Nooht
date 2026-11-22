@@ -1,61 +1,60 @@
-# Native（Lumenoo）设计文档（v0.1.0-dev）
+# Native（Lumenoo）实现状态（v0.1.0-dev）
 
-底座：Jamba 黑盒（Attention + Mamba + MoE），官方权重原样加载，
-Mamba/注意力/MoE 层一行不改，只在外面加外层优化层，再微调。
-不需要预训练，不需要改模型结构。Native 主线默认关闭 Noild；显式配置并传入
-`noild_layer` 后，生成循环在模型 hidden states 与输出投影之间调用 vendored Noild。
-生成循环使用模型原生 `past_key_values`/`cache`（若模型支持），否则回退完整前缀前向。
-前向计算保留的是标准 Transformer 模型 cache；是否适用于具体 Jamba checkpoint 需端到端验证。
-本仓库不包含官方 Jamba 权重或 tokenizer；真实运行需调用方提供可访问的 checkpoint。
+## 底座与训练
+
+Native 通过 `load_jamba_native` 从调用方指定 checkpoint 加载 Transformers 模型与 tokenizer；
+仓库不捆绑权重，也不自动下载。可显式传入已经核实的 `lora_target_modules` 创建 PEFT LoRA。
+`native.lora.train_causal_lm_steps` 和 `training/train_native.py` 提供基本 causal-LM LoRA
+训练路径，训练数据由调用方提供。真实 Jamba checkpoint、target module、训练结果和质量
+尚未在此仓库验收；不把随机初始化模型或接口测试当作权重验收。
 
 ## 1. 多硬件后端（第三节 1）
 
-`native/backend.py`：运行时按 CUDA > ROCm > XLA > oneAPI 检测，
-缺省 CPU 回退。算子覆盖 Mamba selective scan 与 Gated DeltaNet；
-后者依赖第三方线性注意力算子库，非 CUDA 后端可能只有慢速回退，需确认。
-`check_correctness` 将注册实现与纯 PyTorch 参考实现比较前向/反向结果，
-`benchmark` 记录当前设备基础性能；未注册专用 kernel 时使用的仍是参考公式，
-不是上游 Mamba/Gated DeltaNet 算子的替代品。深度 kernel 优化只留接口。
+`native/backend.py` 提供设备检测、kernel 注册表和纯 PyTorch 参考算子。默认没有注册
+CUDA/ROCm/XLA/oneAPI 优化 kernel，`run_op` 会退回参考实现。`backend_status` 区分
+“检测到设备”和“某算子确有注册实现”。这不是完整的多后端 Mamba/Gated DeltaNet 集成；
+注册实现仍需按设备做前向、反向和基准测试。`NativeGenerator.backend` 目前也不接管模型内核。
 
 ## 2. 选择性记忆压缩（第三节 2）
 
-`native/memory_compression.py`：只处理输入上下文，不碰模型内部状态。
-上下文达到一半（`threshold_ratio=0.5`）后按语义片段打分，
-低分片段换为确定性的抽取式摘要或降权。打分 = 辅助打分头（目前未训练）
-+ 规则兜底（新近性/长度/与指令锚点关键词重合）；辅助头需真实训练和特征接入后
-才可用于质量结论。受保护区不参与压缩。消融：`ablation()` 对比长度与片段数。
+`native/memory_compression.py` 支持规则评分、抽取式摘要和压缩长度统计。`ScoringHead`
+可通过 `fit_scoring_head` 使用调用方提供的片段 pooled hidden 与重要性标签训练；推理 head
+需要传入真实 `segment_hidden`，不会再把文本长度伪装成 hidden。普通 Native 生成路径目前
+没有自动提取片段 hidden/打分标签，因此默认使用规则评分；任务质量消融尚未完成。
 
 ## 3. 受保护区（第三节 3）
 
-`native/protected_zone.py`：人设锚点 + 指令锚点 + 思考记忆块合并成同一机制。
-共同机制：不参与压缩、强制可见、固定位置（排到上下文末尾附近）、
-完整注意力层可直接读到。思考文本按变量/约束/待办/结论标签解析；未标注句子
-作为独立结论项，按更新间隔批量写入。人设方案 A/B 对比见 `persona_anchor_ab.md`。
-PersonaAdapter 的 LoRA B 初始为零，未训练/未载入适配器时不应期待人设差异。
+`native/protected_zone.py` 维护人设、指令与结构化思考记忆；`protect_segments` 在压缩前
+保护带标记的区段和思考记忆尾部。PersonaAdapter 是独立的 LoRA 式人设模块，hook 会按激活
+设备/精度适配参数；本模块不等同于对 Jamba 底座的 PEFT LoRA 训练。现有一致性 helper
+只比较两次生成文本是否不同，不是语义人设一致性验收；需用训练后的模型和评测集验证。
 
 ## 4. 复制机制（第三节 4）
 
-`native/copy_mechanism.py`：模型生成 `<copy:start-end>` 指令后，Native 解码器
-从调用方提供的思考文本逐字拷贝对应区间；用户 prompt 中的指令不执行。
-代码范围需 `<final>` 定稿标记。复制不纠错；复制内容的 KV 写入与生成阶段的
-KV cache 目前未做并行融合。训练数据自动构造：`find_longest_overlap` 找最长重合区间。
+`native/copy_mechanism.py` 支持 `<copy:start-end>` 格式、范围校验与代码 `<final>` 标记。
+当前 KV cache 与复制区间并行融合未实现；复制质量及输出耗时未验收。
 
+## 5. 推理预算（第七节 5）
 
-## 5. 推理力度接口（第七节 5）
-
-`NativeConfig.thinking_budget`：当前解码器将其作为生成步数上限截断；
-真正分离的思考/回答预算控制与策略训练尚未接入。
+`NativeConfig.thinking_budget` 当前作为生成 token 上限；真正分离的思考/回答预算策略与训练
+尚未接入。
 
 ## 6. 训练加速栈（第十节）
 
-`training/train_small.yaml`（FlashAttention + Packing + ZeRO-2/FSDP + 异步 CKPT）
-与 `train_large.yaml`（拓扑感知 + DualPipe/1F1B + 3FS + 异步 CKPT + Packing），
-通过配置切换，代码结构一致。小规模验证，大规模只做接口与流程验证。
+`train_native.py` 可执行基本 LoRA causal-LM 训练，支持配置中的序列长度、batch size、
+gradient accumulation、learning rate、BF16，以及请求 Transformers 使用 FlashAttention 2。
+DeepSpeed/FSDP、跨样本 sequence packing、异步 checkpoint 与大规模并行尚未接入；入口对这些
+配置显式告警，而不是报告为已启用。大规模 YAML 仍是目标配置/流程占位，未做实际训练。
 
-## 7. 测试（第十二节相关项）
+## 7. Noild 可插拔路径
 
-- 各后端正确性与基准：`backend.check_correctness` / `benchmark`
-- 记忆压缩开启/关闭消融：`compressor.ablation`
-- 人设一致性（开启/关闭）：`generation.persona_consistency_check`
-- 复制区间逐字匹配率：`CopyDecoder.copy_span` 逐字断言（见 tests）
-- 思考记忆保真率：`ThinkingMemoryBlock.edit_entry` 增量编辑断言
+`NoildLayer` 按显式级联路径构造专家；没有 `general` 阶段的路径不再分配通用专家参数。
+通用阶段的专家由对应路径调用。专家加载管理默认只管理状态；若要实际搬运，须显式提供成对的
+`preload_expert`/`unload_expert` 回调，回调由串行后台线程执行，前向前通过 `ensure_loaded`
+等待搬运完成；`eval()` + `no_grad()` 推理也可直接设置 `offload_device="cpu"` 使用内置模块迁移。
+未配置搬运时不发生物理搬运。
+
+## 8. 验收边界
+
+单测、mock 与随机初始化小模型只验证局部代码路径。真实 Jamba 权重验证、后端性能、记忆任务
+质量、人设一致性、真实 drafter 接受率/加速、复制 KV 并行耗时和大规模训练仍需各自独立测量。

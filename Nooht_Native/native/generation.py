@@ -256,7 +256,7 @@ class NativeGenerator:
             raise ValueError("max_new_tokens 不得为负。")
         budget = thinking_budget if thinking_budget is not None else self.config.thinking_budget
         limit = max_new_tokens if budget is None else min(max_new_tokens, max(0, budget))
-        segments = split_segments(prompt_text)
+        segments = self.protected_zone.protect_segments(split_segments(prompt_text))
         compressed = False
         if self.compressor.should_compress(self._token_count(prompt_text)):
             segments = self.compressor.compress(segments)
@@ -346,8 +346,18 @@ class NativeGenerator:
         )
 
 
-def load_jamba_native(checkpoint: str, config: NativeConfig | None = None):
+def load_jamba_native(
+    checkpoint: str,
+    config: NativeConfig | None = None,
+    *,
+    lora_target_modules: list[str] | None = None,
+    attn_implementation: str | None = None,
+):
     """加载用户指定 checkpoint 与其 tokenizer，不自动下载或构建模型。
+
+    ``lora_target_modules`` 非空时，在模型上创建 PEFT LoRA adapter；模块名必须
+    由调用方按实际 checkpoint/Transformers 版本核实。``attn_implementation``
+    非空时原样传给 Transformers，缺少相应依赖或 kernel 会明确报错。
 
     本仓库不捆绑官方 Jamba 权重或 tokenizer。checkpoint 应指向用户可访问的
     本地目录或 Transformers 支持的模型标识；下载行为由调用方环境决定。
@@ -360,7 +370,13 @@ def load_jamba_native(checkpoint: str, config: NativeConfig | None = None):
     except ImportError as e:
         raise ImportError("加载 Jamba 需要安装 transformers。") from e
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    model = AutoModelForCausalLM.from_pretrained(checkpoint)
+    model_kwargs = {}
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(checkpoint, **model_kwargs)
+    if lora_target_modules is not None:
+        from .lora import attach_lora
+        model = attach_lora(model, cfg, lora_target_modules)
     return model, tokenizer, cfg
 
 

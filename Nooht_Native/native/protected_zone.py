@@ -31,6 +31,8 @@ class PersonaAdapter(nn.Module):
 
     def __init__(self, target_modules: list[str], rank: int = 16, alpha: int = 32):
         super().__init__()
+        if rank <= 0 or alpha <= 0:
+            raise ValueError("PersonaAdapter rank 和 alpha 必须为正数。")
         self.target_modules = target_modules
         self.rank = rank
         self.alpha = alpha
@@ -64,7 +66,11 @@ class PersonaAdapter(nn.Module):
         key = self._name_to_key.get(name)
         if not self.active or key is None:
             return torch.zeros_like(x)
-        return self.scaling * (x @ self.lora_A[key].T @ self.lora_B[key].T)
+        # The adapter is separate from the base model; cast/move its low-rank
+        # matrices to the live activation to support CPU, CUDA and mixed precision.
+        a = self.lora_A[key].to(device=x.device, dtype=x.dtype)
+        b = self.lora_B[key].to(device=x.device, dtype=x.dtype)
+        return self.scaling * (x @ a.T @ b.T)
 
 
 class PersonaSchemeA:
@@ -259,6 +265,20 @@ class ProtectedZone:
         return context_text + "\n" + "\n".join(protected_parts)
 
     def is_protected_text(self, text: str) -> bool:
-        """供记忆压缩判断：受保护区内容不参与压缩。"""
+        """供记忆压缩判断：含受保护区标记的片段不参与压缩。"""
         markers = ("【人设锚点】", "【硬约束】", "【思考记忆块】")
         return any(m in text for m in markers)
+
+    def protect_segments(self, segments: list) -> list:
+        """把提示文本中标记的锚点/记忆块标为不可压缩。
+
+        思考记忆块使用固定尾部区域，因此从其标题开始到输入末尾均受保护。
+        """
+        in_thinking_memory = False
+        for segment in segments:
+            text = getattr(segment, "text", "")
+            if "【思考记忆块】" in text:
+                in_thinking_memory = True
+            if in_thinking_memory or self.is_protected_text(text):
+                segment.protected = True
+        return segments

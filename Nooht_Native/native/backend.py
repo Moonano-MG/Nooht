@@ -1,6 +1,10 @@
-"""外层优化层 1：多硬件后端。
+"""外层优化层 1：后端检测与可插拔算子注册。
 
-对应任务包第三节 1：
+当前文件提供硬件检测、纯 PyTorch 参考实现和 kernel 注册接口；仓库默认没有
+CUDA/ROCm/XLA/oneAPI 优化 kernel。未注册实现时所有后端均显式回退参考实现，
+因此此模块本身不构成多后端性能或算子覆盖验收。
+
+目标规格：
 - 运行时检测 CUDA、ROCm、XLA、oneAPI，替换底层算子实现；
 - 需同时覆盖 Mamba selective scan（Jamba 底座）与 Gated DeltaNet 算子
   （Evolution 底座）；后者依赖第三方线性注意力算子库，
@@ -92,8 +96,26 @@ _KERNELS: dict[tuple[str, Backend], Callable] = {}
 
 
 def register_kernel(op: str, backend: Backend, fn: Callable) -> None:
-    """注册某后端某算子的优化实现（接口预留，本阶段不做深度优化）。"""
+    """注册某后端某算子的实现。注册前先验证实现的前向/反向正确性。"""
+    if op not in ("selective_scan", "gated_delta"):
+        raise KeyError(f"未知算子: {op!r}")
     _KERNELS[(op, backend)] = fn
+
+
+def backend_status(backend: str | Backend) -> dict:
+    """报告哪些算子确有注册实现，避免把后端检测误报为 kernel 支持。"""
+    selected = resolve_backend(backend)
+    ops = sorted(_OP_REFERENCES)
+    implementations = {
+        op: "registered" if (op, selected) in _KERNELS else "reference_fallback"
+        for op in ops
+    }
+    return {
+        "backend": selected.value,
+        "detected": selected is Backend.CPU or selected is detect_backend(),
+        "operators": implementations,
+        "all_optimized": all(value == "registered" for value in implementations.values()),
+    }
 
 
 # -- 纯 PyTorch 参考实现（回退路径，保证跑通） --

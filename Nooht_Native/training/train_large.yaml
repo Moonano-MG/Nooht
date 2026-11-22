@@ -1,6 +1,6 @@
-# 训练加速栈（大规模）：任务包第十节
-# 跨节点拓扑感知通信 + DualPipe / 1F1B + DeepSeek 3FS + 异步 Checkpointing + Sequence Packing
-# 本阶段只做接口与流程验证，不做实际大规模训练
+# 大规模训练目标/流程占位配置（任务包第十节）。
+# 当前 train_native.py 不接入跨节点拓扑通信、DualPipe/1F1B、DeepSeek 3FS、
+# Sequence Packing 或异步 Checkpointing；此配置不是可执行的大规模训练方案。
 scale: large
 attention: flash_attention
 sequence_packing: true

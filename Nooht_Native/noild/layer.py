@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
+from typing import Callable
 
 import torch
 from torch import nn
@@ -40,6 +42,10 @@ class NoildLayer(nn.Module):
         path: 级联路径；None 时默认 Veronoo Tutti 路径。
             可用 get_cascade_path(model, tier) 生成。
         use_loading: 是否启用热度加载管理（默认 True，基础版）。
+        preload_expert/unload_expert: 可选的真实物理搬运回调；由后台线程调用，
+            参数为 ``vertical:{domain}`` / ``general:{index}`` 专家 ID。必须成对传入。
+        offload_device: 可选的推理卸载设备（例如 ``cpu``）；启用时自动将冷专家移到该设备，
+            并在下一次使用前异步移回当前 hidden 所在设备。仅支持 eval 推理。
     """
 
     def __init__(
@@ -47,24 +53,53 @@ class NoildLayer(nn.Module):
         config: NoildConfig,
         path: tuple[str, ...] | None = None,
         use_loading: bool = True,
+        preload_expert: Callable[[str], None] | None = None,
+        unload_expert: Callable[[str], None] | None = None,
+        offload_device: str | torch.device | None = None,
     ):
         super().__init__()
+        if not use_loading and (
+            preload_expert is not None or unload_expert is not None or offload_device is not None
+        ):
+            raise ValueError("传入专家搬运选项时必须启用 use_loading。")
+        if offload_device is not None and (preload_expert is not None or unload_expert is not None):
+            raise ValueError("offload_device 与自定义搬运回调不能同时使用。")
         self.config = config
+        self._offload_device = torch.device(offload_device) if offload_device is not None else None
+        self._active_device: torch.device | None = None
+        self._module_io_lock = threading.RLock()
         self.path: tuple[str, ...] = (
             path if path is not None else get_cascade_path("veronoo", "tutti")
         )
+        # Do not allocate parameters for roles this cascade never executes.
+        # Veronoo Tutti has no general stage; Veronoo Duet has no vertical/merge
+        # stage. Unused modules would be dead, permanently gradient-free weights.
+        uses_draft = "draft" in self.path
+        uses_general = "general" in self.path
+        uses_vertical = "vertical" in self.path
+        uses_merge = "merge" in self.path
+        if uses_general and config.num_general_experts <= 0:
+            raise ValueError("包含 general 阶段的路径至少需要一个通用专家。")
         self.router = DomainRouter(config)
         self.rejudge = RejudgeController(config)
-        self.draft = DraftExpert(config)
+        self.draft = DraftExpert(config) if uses_draft else None
         self.generals = nn.ModuleList(
             [GeneralExpert(config) for _ in range(config.num_general_experts)]
+            if uses_general else []
         )
         self.verticals = nn.ModuleList(
             [VerticalExpert(config, d) for d in range(config.num_domains)]
+            if uses_vertical else []
         )
-        self.merge = MergeExpert(config)
+        self.merge: MergeExpert | None = MergeExpert(config) if uses_merge else None
+        if self._offload_device is not None:
+            preload_expert = self._preload_to_active_device
+            unload_expert = self._offload_to_configured_device
         self.loading: ExpertHeatManager | None = (
-            ExpertHeatManager(config.num_domains, config.num_general_experts)
+            ExpertHeatManager(
+                len(self.verticals), len(self.generals),
+                preload_fn=preload_expert, unload_fn=unload_expert,
+            )
             if use_loading
             else None
         )
@@ -72,9 +107,35 @@ class NoildLayer(nn.Module):
         self._cached_router: RouterOutput | None = None
         self._loading_clock = 0  # 单调加载时钟，不随新请求的 generation step 归零
 
+    def _module_for_expert(self, expert_id: str) -> nn.Module:
+        role, raw_index = expert_id.split(":", 1)
+        index = int(raw_index)
+        if role == "vertical" and 0 <= index < len(self.verticals):
+            return self.verticals[index]
+        if role == "general" and 0 <= index < len(self.generals):
+            return self.generals[index]
+        raise KeyError(f"未知专家 ID: {expert_id!r}")
+
+    def _preload_to_active_device(self, expert_id: str) -> None:
+        if self._active_device is None:
+            raise RuntimeError("首次 forward 前无法确定专家目标设备。")
+        with self._module_io_lock:
+            self._module_for_expert(expert_id).to(self._active_device)
+
+    def _offload_to_configured_device(self, expert_id: str) -> None:
+        if self._offload_device is None:
+            raise RuntimeError("未配置 offload_device。")
+        with self._module_io_lock:
+            self._module_for_expert(expert_id).to(self._offload_device)
+
     def set_load_factor(self, load_factor: float) -> int:
         """负载大时扩大重判间隔 N（供调用方按负载调用）。"""
         return self.rejudge.update_load(load_factor)
+
+    def close(self, wait_for_expert_io: bool = True) -> None:
+        """等待并释放专家搬运工作线程。"""
+        if self.loading is not None:
+            self.loading.close(wait=wait_for_expert_io)
 
     def _general_for_domain(self, domain_id: int, stage_index: int = 0) -> GeneralExpert:
         """按领域与通用阶段确定性选择专家。
@@ -82,6 +143,8 @@ class NoildLayer(nn.Module):
         同一领域在同一阶段可复现；Soleinoo 的前置与末尾通用阶段轮换到
         不同专家（当通用专家数大于 1），实现两个接力角色而非重复调用同一份权重。
         """
+        if not self.generals:
+            raise RuntimeError("当前级联未配置通用专家。")
         return self.generals[(int(domain_id) + stage_index) % len(self.generals)]
 
     def _run_generals(
@@ -89,6 +152,8 @@ class NoildLayer(nn.Module):
         stage_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """按每个 token 的领域确定性选择通用专家，避免批次只用首样本领域。"""
+        if not self.generals:
+            raise RuntimeError("当前级联未配置通用专家，不能执行 general 阶段。")
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_ids = router_out.domain_ids[..., 0].reshape(-1)
         out = torch.zeros_like(flat_hidden)
@@ -100,9 +165,13 @@ class NoildLayer(nn.Module):
             mask = flat_ids == domain
             if not bool(mask.any()):
                 continue
-            expert_out, expert_mtp = self._general_for_domain(domain, stage_index)(
-                flat_hidden[mask], return_logits=return_logits
-            )
+            expert_index = (int(domain) + stage_index) % len(self.generals)
+            if self.loading is not None:
+                self.loading.ensure_loaded(self.loading.general_id(expert_index))
+            with self._module_io_lock:
+                expert_out, expert_mtp = self.generals[expert_index](
+                    flat_hidden[mask], return_logits=return_logits
+                )
             out[mask] = expert_out
             if mtp is not None:
                 mtp[mask] = expert_mtp
@@ -123,6 +192,8 @@ class NoildLayer(nn.Module):
         self, hidden: torch.Tensor, router_out: RouterOutput
     ) -> torch.Tensor:
         """运行路由选中的垂直专家（1 或 2 个），按路由权重加权合并。"""
+        if not self.verticals:
+            raise RuntimeError("当前级联未配置垂直专家，不能执行 vertical 阶段。")
         # router_out.domain_ids: (..., top_vertical)
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_ids = router_out.domain_ids.reshape(-1, router_out.domain_ids.shape[-1])
@@ -134,7 +205,10 @@ class NoildLayer(nn.Module):
                 mask = ids_k == d
                 if not mask.any():
                     continue
-                expert_out = self.verticals[d](flat_hidden[mask])
+                if self.loading is not None:
+                    self.loading.ensure_loaded(self.loading.vertical_id(d))
+                with self._module_io_lock:
+                    expert_out = self.verticals[d](flat_hidden[mask])
                 out[mask] += expert_out * flat_w[mask, k : k + 1]
         return out.view_as(hidden)
 
@@ -154,6 +228,12 @@ class NoildLayer(nn.Module):
             return_aux_logits: 默认训练时计算 draft/MTP logits，推理时跳过未用辅助大词表头；
                 可显式开启以用于验证/消融。
         """
+        if self._offload_device is not None:
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("offload_device 仅支持 no_grad 的 eval 推理。")
+            if self._active_device is not None and hidden.device != self._active_device:
+                raise RuntimeError("offload_device 模式不支持同一层在多个目标设备间切换。")
+            self._active_device = hidden.device
         # step=0 表示新请求的首个输入：丢弃上一请求的缓存，保证每次用户输入必判。
         if not self.training and step == 0 and self._cached_router is not None:
             self._cached_router = None
@@ -222,13 +302,15 @@ class NoildLayer(nn.Module):
             # 独立单调时钟：用户请求的 generation step 会归零，加载热度不能归零。
             load_step = self._loading_clock
             self._loading_clock += 1
-            # 路由判出领域后异步预加载垂直专家（延迟步数后生效）
-            domains = router_out.domain_ids.reshape(-1)[: self.config.top_vertical]
-            self.loading.register_route([int(d) for d in domains.tolist()], load_step)
+            # 路由后调度预加载；真实搬运由回调/内置 offload 完成，前向前会等待。
+            if self.verticals:
+                domains = router_out.domain_ids.reshape(-1).unique()
+                self.loading.register_route([int(d) for d in domains.tolist()], load_step)
             # 通用专家也需记录热度，防止热专家被误标为冷门卸载。
             primary_domains = router_out.domain_ids[..., 0].reshape(-1).unique().tolist()
             for domain in primary_domains:
-                self.loading.register_general_use(int(domain) % self.config.num_general_experts, load_step)
+                if self.generals:
+                    self.loading.register_general_use(int(domain) % len(self.generals), load_step)
             self.loading.drain_preload(load_step)
             self.loading.step(load_step)
 
@@ -245,6 +327,8 @@ class NoildLayer(nn.Module):
             if stage == "router":
                 continue
             elif stage == "draft":
+                if self.draft is None:
+                    raise RuntimeError("当前级联未配置预生成专家，不能执行 draft 阶段。")
                 domain0 = router_out.domain_ids[..., 0]
                 primary_hidden, draft_logits = self.draft(
                     current, domain0, return_logits=compute_aux_logits
@@ -262,6 +346,8 @@ class NoildLayer(nn.Module):
             elif stage == "vertical":
                 current = self._run_verticals(current, router_out)
             elif stage == "merge":
+                if self.merge is None:
+                    raise RuntimeError("当前级联未配置合并专家，不能执行 merge 阶段。")
                 if primary_hidden is None:
                     raise RuntimeError("merge 阶段需要先经过 draft 或 general 阶段。")
                 current = self.merge(

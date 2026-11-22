@@ -6,6 +6,7 @@
 
 import os
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -68,6 +69,11 @@ class TestConfig(unittest.TestCase):
 
 
 class TestRouter(unittest.TestCase):
+    def test_rejudge_controller_constructs_under_meta_context(self):
+        with torch.device("meta"):
+            controller = RejudgeController(small_config())
+        self.assertAlmostEqual(controller.max_entropy, torch.log(torch.tensor(4.0)).item(), places=6)
+
     def test_only_domain_no_tier(self):
         router = DomainRouter(small_config())
         out = router(torch.randn(3, 64))
@@ -94,11 +100,35 @@ class TestRouter(unittest.TestCase):
 class TestLayer(unittest.TestCase):
     def test_veronoo_path_forward(self):
         layer = NoildLayer(small_config(), path=get_cascade_path("veronoo", "tutti"))
+        # Tutti does not contain a general stage: do not retain dead experts.
+        self.assertEqual(len(layer.generals), 0)
+        self.assertFalse(any(name.startswith("generals.") for name, _ in layer.named_parameters()))
         x = torch.randn(2, 8, 64)
         out = layer(x, step=0)
         self.assertEqual(out.hidden.shape, x.shape)
         self.assertIsNotNone(out.draft_logits)
         self.assertEqual(out.draft_logits.shape[-2:], (4, 256))
+        with self.assertRaisesRegex(RuntimeError, "未配置通用专家"):
+            layer._run_generals(x, out.router, return_logits=False)
+
+    def test_general_experts_receive_task_loss_gradients_when_in_path(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=("router", "general"), use_loading=False)
+        self.assertEqual(len(layer.generals), cfg.num_general_experts)
+        out = layer(
+            torch.randn(2, 8, cfg.hidden_size),
+            domain_hint=torch.tensor([0, 1]),
+        )
+        (out.hidden.square().mean() + out.mtp_logits.square().mean()).backward()
+        gradients = [p.grad for p in layer.generals.parameters()]
+        self.assertTrue(gradients)
+        self.assertTrue(all(g is not None for g in gradients))
+        self.assertGreater(sum(float(g.abs().sum()) for g in gradients), 0.0)
+
+    def test_offload_device_is_inference_only(self):
+        layer = NoildLayer(small_config(), path=("router",), offload_device="cpu")
+        with self.assertRaisesRegex(RuntimeError, "仅支持 no_grad"):
+            layer(torch.randn(1, 2, 64))
 
     def test_soleinoo_path_forward(self):
         layer = NoildLayer(small_config(), path=get_cascade_path("soleinoo", "tutti"))
@@ -109,6 +139,9 @@ class TestLayer(unittest.TestCase):
 
     def test_flash_path_no_merge(self):
         layer = NoildLayer(small_config(), path=get_cascade_path("veronoo", "duet"))
+        self.assertEqual(len(layer.verticals), 0)
+        self.assertIsNone(layer.merge)
+        self.assertFalse(any(eid.startswith("vertical:") for eid in layer.loading.loaded))
         out = layer(torch.randn(2, 8, 64))
         self.assertEqual(out.path_taken, ("router", "draft", "general"))
 
@@ -231,6 +264,52 @@ class TestLayer(unittest.TestCase):
         )
         self.assertEqual(output.tolist(), [[1, 2, 3, 4, 5, 6]])
         self.assertEqual(metrics["acceptance_rate"], 1.0)
+        # The extra target bonus token is not a draft and must not inflate acceptance.
+        self.assertEqual(metrics["accepted"], metrics["proposed"])
+        self.assertEqual(metrics["proposed"], 4)
+
+    def test_speculative_probe_reports_partial_acceptance_and_correction(self):
+        def future_draft(ids):
+            logits = torch.zeros(1, 2, 16)
+            logits[0, 0, 2] = 1.0
+            logits[0, 1, 9] = 1.0  # deliberately diverges at the second proposal
+            return logits
+
+        def target(ids):
+            logits = torch.zeros(1, ids.shape[1], 16)
+            for position in range(ids.shape[1]):
+                logits[0, position, position + 2] = 1.0
+            return logits
+
+        output, metrics = speculative_greedy_decode(
+            torch.tensor([[1]]), future_draft, target, 2,
+            draft_num_tokens=2, draft_output_mode="future",
+        )
+        self.assertEqual(output.tolist(), [[1, 2, 3]])
+        self.assertEqual(metrics["proposed"], 2)
+        self.assertEqual(metrics["accepted"], 1)
+        self.assertEqual(metrics["acceptance_rate"], 0.5)
+
+    def test_speculative_decode_stops_at_accepted_eos_inside_draft(self):
+        def future_draft(ids):
+            logits = torch.zeros(1, 3, 16)
+            for index, token in enumerate((2, 3, 4)):
+                logits[0, index, token] = 1.0
+            return logits
+
+        def target(ids):
+            logits = torch.zeros(1, ids.shape[1], 16)
+            for position in range(ids.shape[1]):
+                logits[0, position, position + 2] = 1.0
+            return logits
+
+        output, metrics = speculative_greedy_decode(
+            torch.tensor([[1]]), future_draft, target, 3,
+            draft_num_tokens=3, draft_output_mode="future", eos_token_id=3,
+        )
+        self.assertEqual(output.tolist(), [[1, 2, 3]])
+        self.assertEqual(metrics["accepted"], 2)
+        self.assertEqual(metrics["proposed"], 3)
 
     def test_speculative_causal_output_uses_last_position_only(self):
         def causal_fn(ids):
@@ -302,6 +381,30 @@ class TestLayer(unittest.TestCase):
 
 
 class TestLoadingAndTraining(unittest.TestCase):
+    def test_async_expert_callbacks_run_off_thread_and_reload_before_use(self):
+        main_thread = threading.get_ident()
+        calls = []
+        def preload(expert_id):
+            calls.append(("load", expert_id, threading.get_ident()))
+        def unload(expert_id):
+            calls.append(("unload", expert_id, threading.get_ident()))
+
+        mgr = ExpertHeatManager(
+            num_vertical=2, num_general=0, min_loaded=1, preload_delay=0,
+            preload_fn=preload, unload_fn=unload,
+        )
+        cold_expert = "vertical:1"
+        mgr.heat[cold_expert] = 0.0
+        mgr.last_used_step[cold_expert] = -100
+        mgr.step(100)
+        self.assertNotIn(cold_expert, mgr.loaded)
+        mgr.register_route([1], 101)
+        mgr.ensure_loaded(cold_expert)
+        self.assertIn(cold_expert, mgr.loaded)
+        mgr.close(wait=True)
+        self.assertEqual([kind for kind, eid, _ in calls if eid == cold_expert], ["unload", "load"])
+        self.assertTrue(all(thread_id != main_thread for _, _, thread_id in calls))
+
     def test_cold_start_and_unload(self):
         mgr = ExpertHeatManager(num_vertical=4, num_general=2)
         self.assertEqual(len(mgr.loaded), 6)  # 冷启动全量

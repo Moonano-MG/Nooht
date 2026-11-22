@@ -4,7 +4,7 @@
 底座 Jamba 文件（modeling_jamba.py 等）一行不改，本包只做外层编排。
 """
 
-from .backend import Backend, benchmark, check_correctness, detect_backend, resolve_backend
+from .backend import Backend, backend_status, benchmark, check_correctness, detect_backend, resolve_backend
 from .config import LUMENOO_TIERS, NativeConfig, lumenoo_config
 from .copy_mechanism import (
     CopyDecoder,
@@ -16,10 +16,12 @@ from .copy_mechanism import (
     parse_copy_instruction,
 )
 from .generation import GenerationResult, NativeGenerator, load_jamba_native
+from .lora import attach_lora, train_causal_lm_steps
 from .memory_compression import (
     RuleScorer,
     ScoringHead,
     Segment,
+    fit_scoring_head,
     SelectiveMemoryCompressor,
     split_segments,
 )
@@ -33,6 +35,7 @@ from .protected_zone import (
 
 __all__ = [
     "Backend",
+    "backend_status",
     "benchmark",
     "check_correctness",
     "detect_backend",
@@ -50,9 +53,12 @@ __all__ = [
     "GenerationResult",
     "NativeGenerator",
     "load_jamba_native",
+    "attach_lora",
+    "train_causal_lm_steps",
     "RuleScorer",
     "ScoringHead",
     "Segment",
+    "fit_scoring_head",
     "SelectiveMemoryCompressor",
     "split_segments",
     "InstructionAnchor",

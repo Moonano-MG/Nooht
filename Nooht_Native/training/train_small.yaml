@@ -1,6 +1,6 @@
-# 训练加速栈（小规模）：任务包第十节
-# FlashAttention + Sequence Packing + DeepSpeed ZeRO-2 或 FSDP + 异步 Checkpointing
-# 两套通过配置切换，代码结构一致；小规模验证，大规模只做接口与流程验证
+# 小规模训练目标配置（任务包第十节），不是所有优化均已接入。
+# train_native.py 支持请求 FlashAttention 2、BF16、batch/grad accumulation 和序列长度。
+# Sequence Packing、DeepSpeed ZeRO-2/FSDP 与异步 Checkpointing 暂未实现，运行时会告警。
 scale: small
 attention: flash_attention
 sequence_packing: true
