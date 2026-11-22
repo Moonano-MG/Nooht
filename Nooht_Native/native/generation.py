@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import re
 from dataclasses import dataclass
@@ -125,6 +126,30 @@ class NativeGenerator:
             cache_arg = "past_key_values"  # for **kwargs-style HF wrappers
         return use_cache and (cache_arg in parameters or var_kwargs), cache_arg
 
+    def _supports_forward_arg(self, name: str) -> bool:
+        signature = self._forward_signature()
+        if signature is None:
+            return False
+        return name in signature.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+        )
+
+    def _initialize_model_cache(self, device: torch.device, batch_size: int):
+        """主动创建 Jamba 的混合 cache；其 forward 不会自动初始化 cache。"""
+        config = getattr(self.model, "config", None)
+        if config is None or getattr(config, "model_type", None) != "jamba":
+            return None
+        try:
+            module = importlib.import_module(self.model.__class__.__module__)
+            cache_class = getattr(module, "HybridMambaAttentionDynamicCache")
+            dtype = next(self.model.parameters()).dtype
+            return cache_class(
+                config, batch_size=batch_size, dtype=dtype, device=device
+            )
+        except (ImportError, AttributeError, StopIteration, TypeError, ValueError):
+            # 未识别 transformers 版本时退回模型的通用 use_cache 行为。
+            return None
+
     @staticmethod
     def _extract_logits(output) -> torch.Tensor:
         if hasattr(output, "logits"):
@@ -148,7 +173,11 @@ class NativeGenerator:
             cache = output.get("past_key_values", output.get("cache"))
         return cache
 
-    def _forward_logits(self, input_ids: torch.Tensor, step: int, past_cache=None, cache_arg: str = "past_key_values", use_cache: bool = False):
+    def _forward_logits(
+        self, input_ids: torch.Tensor, step: int, past_cache=None,
+        cache_arg: str = "past_key_values", use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+    ):
         kwargs = {"input_ids": input_ids}
         supports_cache, detected_arg = self._cache_call_support()
         if use_cache and supports_cache:
@@ -156,6 +185,8 @@ class NativeGenerator:
             cache_arg = detected_arg
             if past_cache is not None:
                 kwargs[cache_arg] = past_cache
+            if cache_position is not None and self._supports_forward_arg("cache_position"):
+                kwargs["cache_position"] = cache_position
         if self.noild_layer is None:
             output = self.model(**kwargs)
             return self._extract_logits(output), self._extract_cache(output)
@@ -244,7 +275,8 @@ class NativeGenerator:
         generated = torch.empty((base_ids.shape[0], 0), dtype=base_ids.dtype, device=device)
         steps = 0
         cache_supported, cache_arg = self._cache_call_support()
-        cache = None
+        cache = self._initialize_model_cache(device, base_ids.shape[0]) if cache_supported else None
+        position_cursor = 0
         pending_ids = base_ids
         cache_used = False
         self.model.eval() if hasattr(self.model, "eval") else None
@@ -260,15 +292,25 @@ class NativeGenerator:
                         anchor = self.protected_zone.instruction.get_anchor_text()
                         if anchor:
                             input_ids = torch.cat((input_ids, self._encode("\n" + anchor, device)), dim=1)
+                    positions = torch.arange(
+                        position_cursor, position_cursor + input_ids.shape[1], device=device
+                    )
                     logits, new_cache = self._forward_logits(
-                        input_ids, step, past_cache=cache, cache_arg=cache_arg, use_cache=True
+                        input_ids, step, past_cache=cache, cache_arg=cache_arg,
+                        use_cache=True, cache_position=positions,
                     )
+                    position_cursor += input_ids.shape[1]
                     cache = new_cache
-                    cache_used = True
+                    cache_used = cache_used or new_cache is not None
                 elif cache_supported and step == 0:
-                    logits, cache = self._forward_logits(
-                        pending_ids, step, cache_arg=cache_arg, use_cache=True
+                    positions = torch.arange(
+                        position_cursor, position_cursor + pending_ids.shape[1], device=device
                     )
+                    logits, cache = self._forward_logits(
+                        pending_ids, step, cache_arg=cache_arg, use_cache=True,
+                        cache_position=positions,
+                    )
+                    position_cursor += pending_ids.shape[1]
                     cache_used = cache is not None
                 else:
                     if step == 0:
