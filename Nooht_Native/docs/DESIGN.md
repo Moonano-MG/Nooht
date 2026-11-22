@@ -20,14 +20,15 @@ CUDA/ROCm/XLA/oneAPI 优化 kernel，`run_op` 会退回参考实现。`backend_s
 `native/memory_compression.py` 支持规则评分、抽取式摘要和压缩长度统计。`ScoringHead`
 可通过 `fit_scoring_head` 使用调用方提供的片段 pooled hidden 与重要性标签训练；推理 head
 需要传入真实 `segment_hidden`，不会再把文本长度伪装成 hidden。普通 Native 生成路径目前
-没有自动提取片段 hidden/打分标签，因此默认使用规则评分；任务质量消融尚未完成。
+没有自动提取片段 hidden/打分标签，因此默认使用规则评分。摘要若不比原片段短则保留原文，
+避免压缩反而扩大字符预算；这不保证整体 token 数必然下降，任务质量消融尚未完成。
 
 ## 3. 受保护区（第三节 3）
 
 `native/protected_zone.py` 维护人设、指令与结构化思考记忆；`protect_segments` 在压缩前
 保护带标记的区段和思考记忆尾部。PersonaAdapter 是独立的 LoRA 式人设模块，hook 会按激活
 设备/精度适配参数；本模块不等同于对 Jamba 底座的 PEFT LoRA 训练。现有一致性 helper
-只比较两次生成文本是否不同，不是语义人设一致性验收；需用训练后的模型和评测集验证。
+只比较两次生成文本是否不同，不是语义人设一致性验收；需用训练后的模型和评测集验证。受保护内容会附加到提示末尾并按步数重注入；`force_visible` 当前只是 CSA2 集成意图，尚无稀疏注意力 mask，不能宣称已强制 attention 选中。
 
 ## 4. 复制机制（第三节 4）
 

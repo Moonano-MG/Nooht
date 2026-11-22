@@ -18,6 +18,7 @@ from noild import (
     NoildLayer,
     get_cascade_path,
     draft_loss,
+    future_token_targets,
     load_balance_loss,
     mtp_loss,
     set_trainable,
@@ -66,6 +67,69 @@ class TestConfig(unittest.TestCase):
                            merge_window_growth_steps=10)
         self.assertEqual(cfg.merge_window_at_step(0), 2)
         self.assertEqual(cfg.merge_window_at_step(1000), 10)
+
+
+class TestIntegrationAdapters(unittest.TestCase):
+    def test_jamba_replaces_only_sparse_moe_feed_forwards(self):
+        from examples.jamba_integration import (
+            install_noild_on_jamba_moe_layers,
+            reset_noild_generation,
+        )
+
+        class JambaSparseMoeBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.router = torch.nn.Linear(64, 4)
+                self.experts = torch.nn.ModuleList()
+
+        class Decoder(torch.nn.Module):
+            def __init__(self, feed_forward):
+                super().__init__()
+                self.feed_forward = feed_forward
+
+        class Backbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([
+                    Decoder(JambaSparseMoeBlock()),
+                    Decoder(torch.nn.Linear(64, 64)),
+                ])
+
+        class CausalLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Backbone()
+
+        model = CausalLM()
+        replaced = install_noild_on_jamba_moe_layers(model, small_config())
+        self.assertEqual(replaced, [0])
+        self.assertEqual(model.model.layers[0].feed_forward.__class__.__name__, "NoildJambaFeedForward")
+        self.assertIsInstance(model.model.layers[1].feed_forward, torch.nn.Linear)
+        model.model.layers[0].feed_forward.step = 7
+        reset_noild_generation(model)
+        self.assertEqual(model.model.layers[0].feed_forward.step, 0)
+
+    def test_qwen_adapter_requires_and_replaces_explicit_paths(self):
+        from examples.qwen_hybrid_integration import install_noild_on_qwen_mlp_modules
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = torch.nn.Linear(64, 64)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer()])
+
+        model = Model()
+        installed = install_noild_on_qwen_mlp_modules(
+            model, small_config(), ["layers.0.mlp"]
+        )
+        self.assertEqual(installed, ["layers.0.mlp"])
+        self.assertEqual(model.layers[0].mlp.__class__.__name__, "NoildQwenFeedForward")
+        with self.assertRaisesRegex(ValueError, "module_paths"):
+            install_noild_on_qwen_mlp_modules(model, small_config(), [])
 
 
 class TestRouter(unittest.TestCase):
@@ -198,8 +262,11 @@ class TestLayer(unittest.TestCase):
         x = torch.ones(1, 1, cfg.hidden_size)
         for step in range(50):
             layer(x, step=step)
-        self.assertLess(calls, 20)  # 不会因高熵每个 token 重判
-        self.assertGreater(calls, 1)
+        self.assertEqual(calls, 13)  # 未校准时仅按 interval 重判，不由随机熵触发
+        layer.mark_router_uncertainty_calibrated()
+        out = layer(x, step=49)
+        self.assertEqual(out.rejudge_reason, "uncertainty")
+        self.assertEqual(calls, 5)
 
     def test_repeated_general_stages_select_distinct_experts(self):
         layer = NoildLayer(small_config(num_general_experts=2), path=("router", "general", "general"), use_loading=False)
@@ -236,6 +303,11 @@ class TestLayer(unittest.TestCase):
             if expert.mtp_head.proj.weight.grad is not None
         )
         self.assertGreater(mtp_grad, 0)
+
+    def test_future_token_targets_align_and_mask_sequence_tail(self):
+        labels = torch.tensor([[10, 11, 12, 13]])
+        targets = future_token_targets(labels, num_tokens=3)
+        self.assertEqual(targets.tolist(), [[[10, 11, 12], [11, 12, 13], [12, 13, -100], [13, -100, -100]]])
 
     def test_speculative_prefix_verification(self):
         accepted, rate = verify_draft(torch.tensor([4, 7, 3, 8]), torch.tensor([4, 7, 5, 8]))
@@ -367,8 +439,30 @@ class TestLayer(unittest.TestCase):
         history = train_noild(layer, head, [batch], optimizer)
         self.assertIn("draft_loss", history[0])
         self.assertIn("mtp_loss", history[0])
-        with self.assertRaisesRegex(KeyError, "draft_target_ids"):
-            train_noild(layer, head, [{k: v for k, v in batch.items() if k != "draft_target_ids"}], optimizer)
+        # Targets can be derived from next-token labels; no manually generated random targets needed.
+        auto_history = train_noild(
+            layer, head,
+            [{k: v for k, v in batch.items() if k not in ("draft_target_ids", "mtp_target_ids")}],
+            optimizer,
+        )
+        self.assertIn("draft_loss", auto_history[0])
+        self.assertIn("mtp_loss", auto_history[0])
+
+    def test_tutti_records_mtp_not_applicable_and_rejects_stray_mtp_targets(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=get_cascade_path("veronoo", "tutti"), use_loading=False)
+        head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size)
+        optimizer = torch.optim.AdamW(list(layer.parameters()) + list(head.parameters()), lr=1e-3)
+        batch = {
+            "hidden": torch.randn(2, 4, cfg.hidden_size),
+            "target_ids": torch.randint(cfg.vocab_size, (2, 4)),
+        }
+        history = train_noild(layer, head, [batch], optimizer)
+        self.assertEqual(history[0]["mtp_status"], "not_applicable:no_general_stage")
+        self.assertNotIn("mtp_loss", history[0])
+        batch["mtp_target_ids"] = torch.randint(cfg.vocab_size, (2, 4, cfg.mtp_num_tokens))
+        with self.assertRaisesRegex(ValueError, "没有 general/MTP"):
+            train_noild(layer, head, [batch], optimizer)
 
     def test_merge_both_sources(self):
         merge = MergeExpert(small_config())
