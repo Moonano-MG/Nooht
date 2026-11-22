@@ -75,6 +75,19 @@ jobs:
               print(f"- final val_loss: {r['final_val']}, best val_loss: {r['best_val']} @ step {r['best_step']}")
           EOF
 
+      - name: Report (annotations are readable via the API)
+        if: always()
+        run: |
+          python - <<'EOF'
+          import glob, json, os
+          for f in glob.glob("train-out/res_noild_*.json"):
+              r = json.load(open(f))
+              print(f"::notice title=noild result::status={r['status']} steps_done={r['steps_done']}/{r['steps_requested']} params={r['params']} wall_s={r['wall_s']} cpu_count={os.cpu_count()} torch={r['torch']}")
+              print(f"::notice title=noild final::final_val={r['final_val']} best_val={r['best_val']} best_step={r['best_step']}")
+              curve = " ".join(f"{x['step']}:{x['val_loss']}" for x in r["log"])
+              print(f"::notice title=noild val curve::{curve}")
+          EOF
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
