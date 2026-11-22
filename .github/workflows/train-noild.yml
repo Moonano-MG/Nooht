@@ -1,7 +1,7 @@
 name: train-noild
 
 # Same-budget pair training, Noild side (Jamba with 2 MoE blocks replaced by NoildLayer).
-# Only one run at a time: a newly dispatched run cancels the older in-progress run.
+# Seeds 0, 1, 2 run as parallel jobs. A newer push cancels the older in-progress run of the same seed.
 # Hard limit: job timeout 60 min; the script also stops training after --max_minutes (45).
 
 on:
@@ -13,28 +13,27 @@ on:
   workflow_dispatch:
     inputs:
       steps:
-        description: "training steps (same value must be used for train-native)"
+        description: "training steps (must match train-native)"
         required: false
         default: "2000"
-      seed:
-        description: "random seed"
-        required: false
-        default: "0"
 
 permissions:
   contents: read
-
-concurrency:
-  group: train-noild
-  cancel-in-progress: true
 
 jobs:
   train:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [0, 1, 2]
+    concurrency:
+      group: train-noild-seed${{ matrix.seed }}-${{ github.ref }}
+      cancel-in-progress: true
     env:
       STEPS: ${{ inputs.steps || '2000' }}
-      SEED: ${{ inputs.seed || '0' }}
+      SEED: ${{ matrix.seed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -59,22 +58,6 @@ jobs:
             --corpus train-out/corpus.bin --threads "$(nproc)" --max_minutes 45 \
             --out train-out/res_noild_s${SEED}.json 2>&1 | tee train-out/log_noild_s${SEED}.txt
 
-      - name: Summary
-        if: always()
-        run: |
-          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import glob, json
-          files = glob.glob("train-out/res_noild_*.json")
-          if not files:
-              print("### Noild training: no result file was produced")
-          for f in files:
-              r = json.load(open(f))
-              print("### Noild training")
-              print(f"- status: {r['status']}, steps_done: {r['steps_done']}/{r['steps_requested']}")
-              print(f"- params: {r['params']}, wall_s: {r['wall_s']}")
-              print(f"- final val_loss: {r['final_val']}, best val_loss: {r['best_val']} @ step {r['best_step']}")
-          EOF
-
       - name: Report (annotations are readable via the API)
         if: always()
         run: |
@@ -82,17 +65,17 @@ jobs:
           import glob, json, os
           for f in glob.glob("train-out/res_noild_*.json"):
               r = json.load(open(f))
-              print(f"::notice title=noild result::status={r['status']} steps_done={r['steps_done']}/{r['steps_requested']} params={r['params']} wall_s={r['wall_s']} cpu_count={os.cpu_count()} torch={r['torch']}")
-              print(f"::notice title=noild final::final_val={r['final_val']} best_val={r['best_val']} best_step={r['best_step']}")
+              print(f"::notice title=noild seed {r['seed']} result::status={r['status']} steps_done={r['steps_done']}/{r['steps_requested']} params={r['params']} wall_s={r['wall_s']} cpu_count={os.cpu_count()} torch={r['torch']}")
+              print(f"::notice title=noild seed {r['seed']} final::final_val={r['final_val']} best_val={r['best_val']} best_step={r['best_step']}")
               curve = " ".join(f"{x['step']}:{x['val_loss']}" for x in r["log"])
-              print(f"::notice title=noild val curve::{curve}")
+              print(f"::notice title=noild seed {r['seed']} val curve::{curve}")
           EOF
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: train-noild-seed${{ env.SEED }}
+          name: train-noild-seed${{ matrix.seed }}
           path: |
             train-out/res_noild_*.json
             train-out/log_noild_*.txt
