@@ -266,7 +266,7 @@ class TestLayer(unittest.TestCase):
         layer.mark_router_uncertainty_calibrated()
         out = layer(x, step=49)
         self.assertEqual(out.rejudge_reason, "uncertainty")
-        self.assertEqual(calls, 5)
+        self.assertEqual(calls, 14)  # 计数为累计值：此前 13 次 interval 重判 + 校准后 1 次不确定性重判
 
     def test_repeated_general_stages_select_distinct_experts(self):
         layer = NoildLayer(small_config(num_general_experts=2), path=("router", "general", "general"), use_loading=False)

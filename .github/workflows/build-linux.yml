@@ -1,0 +1,32 @@
+name: build-linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v0.1.0-dev]
+  pull_request:
+    branches: [v0.1.0-dev]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile, build wheel, test and run examples
+        run: bash scripts/build_linux.sh
+
+      - name: Upload artifacts (wheel, sdist, SHA256SUMS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: noild-linux-artifacts
+          path: dist-linux/artifacts/
+          retention-days: 14
