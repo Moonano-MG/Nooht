@@ -41,6 +41,8 @@ class DomainRouter(nn.Module):
         self.num_domains = config.num_domains
         self.top_vertical = config.top_vertical
         self.weight = nn.Linear(config.hidden_size, config.num_domains, bias=False)
+        # Entropy thresholds are not meaningful until calibrated on a trained router.
+        self.calibrated = bool(config.router_uncertainty_calibrated)
 
     def forward(self, hidden: torch.Tensor) -> RouterOutput:
         # hidden: (..., hidden_size)

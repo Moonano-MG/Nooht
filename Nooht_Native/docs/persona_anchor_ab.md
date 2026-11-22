@@ -2,7 +2,7 @@
 
 人设锚点：推理时可插拔的轻量模块（adapter/LoRA 式），
 同一套底座权重，加载即开启，卸载即关闭，每次生成强制参考。
-Lumenoo 必须完整支持；Veronoo、Soleinoo 可选。
+规格要求 Lumenoo 完整支持；当前实现提供锚点注入与可插拔低秩 hook 接口，但不包含已训练的人设权重或语义一致性验收，必须用目标 checkpoint 与训练后的 adapter 验证后才可称完整支持。
 
 ## 方案 A：两套权重（`PersonaSchemeA`）
 
@@ -19,5 +19,4 @@ Lumenoo 必须完整支持；Veronoo、Soleinoo 可选。
 ## 结论
 
 主线选方案 B（可插拔），方案 A 作为对照保留。
-人设一致性测试：`persona_consistency_check` 对比开启/关闭两次生成，
-开启时必须强制参考人设锚点文本。
+当前 `persona_consistency_check` 仅报告两次输出是否不同及 adapter 是否已激活；输出不同不等同语义一致性通过。推理时锚点文本由 NativeGenerator 加入提示并周期重注入。CSA2 稀疏注意力的强制可见性尚未实现，需待 attention 集成后验收。

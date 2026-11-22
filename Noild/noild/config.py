@@ -41,6 +41,7 @@ class NoildConfig:
     router_rejudge_interval: int = 16  # 基础 N
     router_rejudge_max_interval: int = 64  # 负载大时扩大 N 的上限
     router_uncertainty_threshold: float = 0.9  # 归一化熵超过此值提前重判（0~1）
+    router_uncertainty_calibrated: bool = False  # 仅在验证集校准后启用熵触发
     router_topic_shift_threshold: float = 0.5  # 与上次路由 hidden 余弦漂移超过此值提前重判
 
     # 训练：负载约束，防止垂直专家被饿死
@@ -63,6 +64,8 @@ class NoildConfig:
             raise ValueError("top_vertical 允许为 1 或 2（路由可同时选 2 个垂直专家）。")
         if self.merge_window_start > self.merge_window_max:
             raise ValueError("merge_window_start 不得大于 merge_window_max。")
+        if not 0.0 <= self.router_uncertainty_threshold <= 1.0:
+            raise ValueError("router_uncertainty_threshold 必须位于 [0, 1]。")
         if self.draft_hidden_size >= self.hidden_size:
             raise ValueError("预生成专家应小于主 hidden_size（小而快）。")
 

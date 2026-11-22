@@ -57,6 +57,12 @@ class NativeConfig:
             raise ValueError("persona_scheme 只能是 A 或 B。")
         if not 0 < self.compression_threshold_ratio <= 1:
             raise ValueError("compression_threshold_ratio 需在 (0, 1] 内。")
+        if self.max_context_len <= 0:
+            raise ValueError("max_context_len 必须为正数。")
+        if self.instruction_reinject_every <= 0:
+            raise ValueError("instruction_reinject_every 必须为正数。")
+        if self.thinking_memory_capacity <= 0 or self.thinking_memory_min_interval < 0:
+            raise ValueError("思考记忆容量必须为正，最小更新间隔不得为负。")
 
 
 # Lumenoo 三档默认（任务包第五节：按底座规格或 LoRA 规格大小划分）

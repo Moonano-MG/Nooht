@@ -7,9 +7,9 @@
 2. 指令锚点：系统提示和用户硬约束，生成中定期回看。
 3. 思考记忆块：见任务包第七节（固定区域、结构化条目、增量编辑）。
 
-共同机制：不参与记忆压缩；强制可见（CSA2 稀疏注意力中强制选中）；
-固定位置（靠近当前位置，更新后重新排到上下文末尾附近）；
-完整注意力层可直接读到（线性层状态有损）。
+共同机制：不参与本模块的记忆压缩；放在上下文末尾附近并由 NativeGenerator 定期重注入。
+`force_visible` 仅记录未来 CSA2 集成意图：当前仓库没有 CSA2 attention mask，
+因此不能声称已经对稀疏注意力强制选中；完整注意力层可直接读取（线性层状态有损）。
 """
 
 from __future__ import annotations
@@ -103,6 +103,10 @@ class InstructionAnchor:
     hard_constraints: list[str] = field(default_factory=list)
     reinject_every: int = 256
 
+    def __post_init__(self):
+        if self.reinject_every <= 0:
+            raise ValueError("reinject_every 必须为正数。")
+
     def get_anchor_text(self) -> str:
         parts = [self.system_prompt] + [f"【硬约束】{c}" for c in self.hard_constraints]
         return "\n".join(p for p in parts if p)
@@ -132,6 +136,10 @@ class ThinkingMemoryBlock:
     _pending_entries: dict[str, dict[str, str]] = field(default_factory=dict)
 
     CATEGORIES = ("variables", "constraints", "todos", "conclusions")
+
+    def __post_init__(self):
+        if self.capacity <= 0 or self.min_interval < 0:
+            raise ValueError("思考记忆容量必须为正，最小更新间隔不得为负。")
 
     def can_update(self, step: int) -> bool:
         return self._has_new_info and (step - self._last_update_step) >= self.min_interval
@@ -244,7 +252,7 @@ class ProtectedZone:
     persona_text: str = ""
     instruction: InstructionAnchor = field(default_factory=InstructionAnchor)
     thinking_memory: ThinkingMemoryBlock = field(default_factory=ThinkingMemoryBlock)
-    force_visible: bool = True  # CSA2 稀疏注意力中强制选中，不允许被稀疏掉
+    force_visible: bool = True  # 预留 CSA2 集成意图；当前 NativeGenerator 尚无稀疏注意力 mask
 
     def assemble(self, context_text: str, step: int = 0) -> str:
         """固定位置：受保护内容排到上下文末尾附近（靠近当前位置）。

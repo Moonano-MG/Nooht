@@ -5,11 +5,21 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT / "Noild") not in sys.path:
+    sys.path.insert(0, str(ROOT / "Noild"))
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from noild import NoildConfig, NoildLayer, draft_loss, load_balance_loss, mtp_loss
+from noild import (
+    NoildConfig, NoildLayer, draft_loss, future_token_targets,
+    load_balance_loss, mtp_loss,
+)
 
 
 class SmokeLM(nn.Module):
@@ -43,10 +53,8 @@ def main(steps: int = 20) -> None:
         targets = torch.randint(0, config.vocab_size, (batch, seq))
         logits, out = model(input_ids, step)
         lm = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
-        future_draft = torch.randint(
-            0, config.vocab_size, (batch, seq, config.draft_num_tokens)
-        )
-        future_mtp = torch.randint(0, config.vocab_size, (batch, seq, config.mtp_num_tokens))
+        future_draft = future_token_targets(targets, config.draft_num_tokens)
+        future_mtp = future_token_targets(targets, config.mtp_num_tokens)
         dl = draft_loss(out.draft_logits, future_draft)
         ml = mtp_loss(out.mtp_logits, future_mtp)
         lb = load_balance_loss(

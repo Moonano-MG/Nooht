@@ -85,30 +85,71 @@ def upcycle_init(vertical_experts: nn.ModuleList, source_mlp: ExpertMLP) -> None
         mlp.down_proj.weight.data.copy_(source_mlp.down_proj.weight.data)
 
 
-def draft_loss(draft_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-    """预生成专家训练 loss：草稿 token 的交叉熵。
+def future_token_targets(
+    next_token_ids: torch.Tensor, num_tokens: int, ignore_index: int = -100
+) -> torch.Tensor:
+    """由按 hidden 位置对齐的 next-token labels 构造多步目标。
+
+    ``next_token_ids[..., t]`` 是 hidden[..., t, :] 的一步目标。返回
+    ``(..., sequence, num_tokens)``，后续预测越过样本末尾的位置置为 ignore_index。
+    """
+    if next_token_ids.ndim < 2 or num_tokens <= 0:
+        raise ValueError("next_token_ids 至少需有 batch/sequence 两维，num_tokens 必须为正。")
+    seq_len = next_token_ids.shape[-1]
+    result = next_token_ids.new_full((*next_token_ids.shape, num_tokens), ignore_index)
+    for horizon in range(num_tokens):
+        valid = seq_len - horizon
+        if valid > 0:
+            result[..., :valid, horizon] = next_token_ids[..., horizon:]
+    return result
+
+
+def _horizon_cross_entropy(
+    logits: torch.Tensor, target_ids: torch.Tensor, horizon_decay: float = 0.5,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    if logits.ndim < 3 or target_ids.shape != logits.shape[:-1]:
+        raise ValueError("预测 logits 与 target 形状必须分别为 (..., K, V) 与 (..., K)。")
+    if not 0 < horizon_decay <= 1:
+        raise ValueError("horizon_decay 必须位于 (0, 1]。")
+    losses, weights = [], []
+    horizons = target_ids.shape[-1]
+    for horizon in range(horizons):
+        labels = target_ids[..., horizon].reshape(-1)
+        valid = labels != ignore_index
+        if not bool(valid.any()):
+            continue
+        per_item = F.cross_entropy(
+            logits[..., horizon, :].reshape(-1, logits.shape[-1]),
+            labels,
+            ignore_index=ignore_index,
+            reduction="none",
+        )
+        losses.append(per_item[valid].mean())
+        weights.append(horizon_decay ** horizon)
+    if not losses:
+        raise ValueError("所有预测目标均为 ignore_index，无法计算辅助 loss。")
+    weight_tensor = logits.new_tensor(weights)
+    return (torch.stack(losses) * weight_tensor).sum() / weight_tensor.sum()
+
+
+def draft_loss(
+    draft_logits: torch.Tensor, target_ids: torch.Tensor,
+    horizon_decay: float = 0.5, ignore_index: int = -100,
+) -> torch.Tensor:
+    """草稿 token 交叉熵；较近预测获得较高权重，契合连续前缀接受目标。
 
     draft_logits: (..., draft_num_tokens, vocab_size)
-    target_ids: (..., draft_num_tokens) 真实未来 token id。
-    训练时必须把此 loss 加入总 loss，否则 draft_head 梯度恒为 0。
+    target_ids: (..., draft_num_tokens)，尾部无未来标签可用 ignore_index 屏蔽。
     """
-    return F.cross_entropy(
-        draft_logits.reshape(-1, draft_logits.shape[-1]),
-        target_ids.reshape(-1),
-    )
+    return _horizon_cross_entropy(draft_logits, target_ids, horizon_decay, ignore_index)
 
 
-def mtp_loss(mtp_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-    """MTP 头训练 loss：未来 k 个 token 的交叉熵（与 draft_loss 同形）。
-
-    mtp_logits: (..., mtp_num_tokens, vocab_size)
-    target_ids: (..., mtp_num_tokens)
-    训练时必须加入总 loss，否则 mtp_head 梯度恒为 0。
-    """
-    return F.cross_entropy(
-        mtp_logits.reshape(-1, mtp_logits.shape[-1]),
-        target_ids.reshape(-1),
-    )
+def mtp_loss(
+    mtp_logits: torch.Tensor, target_ids: torch.Tensor, ignore_index: int = -100
+) -> torch.Tensor:
+    """MTP 头多步交叉熵，忽略样本边界后的无效预测位置。"""
+    return _horizon_cross_entropy(mtp_logits, target_ids, horizon_decay=1.0, ignore_index=ignore_index)
 
 
 def train_noild(
@@ -117,19 +158,27 @@ def train_noild(
     batches: Iterable[Mapping[str, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
     *,
-    draft_weight: float = 0.1,
+    draft_weight: float = 1.0,
+    draft_horizon_decay: float = 0.5,
     mtp_weight: float = 0.1,
     max_grad_norm: float | None = 1.0,
-) -> list[dict[str, float]]:
+) -> list[dict[str, float | str]]:
     """在已由底座产生的 hidden states 上训练 Noild 与输出头。
 
-    每个 batch 必须包含 ``hidden``、``target_ids``；若级联路径启用 draft 或
-    general/MTP 阶段，还必须提供 ``draft_target_ids`` / ``mtp_target_ids``，
-    避免预测头在没有 loss 的情况下静默训练。返回逐步 loss 指标。
+    ``target_ids`` 是按 hidden 序列位置对齐的一步 next-token labels；缺省时由它
+    自动构造 draft/MTP 多步目标，尾部无效位置以 ignore_index 屏蔽。显式传入的辅助
+    targets 可覆盖自动生成。路径启用了辅助头却未产出 logits 时立即报错；未启用 MTP
+    的路径会记录 ``mtp_status=not_applicable``，绝不静默略过。返回逐步 loss 指标。
     """
+    if draft_weight < 0 or mtp_weight < 0:
+        raise ValueError("draft_weight 与 mtp_weight 不得为负。")
+    if not 0 < draft_horizon_decay <= 1:
+        raise ValueError("draft_horizon_decay 必须位于 (0, 1]。")
+    uses_draft = "draft" in layer.path
+    uses_mtp = "general" in layer.path
     layer.train()
     lm_head.train()
-    history: list[dict[str, float]] = []
+    history: list[dict[str, float | str]] = []
     for step, batch in enumerate(batches):
         if "hidden" not in batch or "target_ids" not in batch:
             raise KeyError("每个 batch 必须含 hidden 和 target_ids。")
@@ -140,19 +189,35 @@ def train_noild(
         logits = lm_head(output.hidden)
         lm = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
         loss = lm
-        values = {"lm_loss": float(lm.detach())}
-        if output.draft_logits is not None:
-            if "draft_target_ids" not in batch:
-                raise KeyError("级联启用 draft 时需提供 draft_target_ids。")
-            aux = draft_loss(output.draft_logits, batch["draft_target_ids"])
+        values: dict[str, float | str] = {"lm_loss": float(lm.detach())}
+        if uses_draft:
+            if output.draft_logits is None:
+                raise RuntimeError("路径包含 draft，但 NoildLayer 未返回 draft_logits。")
+            draft_targets = batch.get("draft_target_ids")
+            if draft_targets is None:
+                draft_targets = future_token_targets(targets, output.draft_logits.shape[-2])
+            aux = draft_loss(output.draft_logits, draft_targets, horizon_decay=draft_horizon_decay)
             loss = loss + draft_weight * aux
             values["draft_loss"] = float(aux.detach())
-        if output.mtp_logits is not None:
-            if "mtp_target_ids" not in batch:
-                raise KeyError("级联启用 MTP 时需提供 mtp_target_ids。")
-            aux = mtp_loss(output.mtp_logits, batch["mtp_target_ids"])
+            values["draft_status"] = "trained"
+        else:
+            if "draft_target_ids" in batch:
+                raise ValueError("batch 提供了 draft_target_ids，但当前路径没有 draft 阶段。")
+            values["draft_status"] = "not_applicable:no_draft_stage"
+        if uses_mtp:
+            if output.mtp_logits is None:
+                raise RuntimeError("路径包含 general/MTP，但 NoildLayer 未返回 mtp_logits。")
+            mtp_targets = batch.get("mtp_target_ids")
+            if mtp_targets is None:
+                mtp_targets = future_token_targets(targets, output.mtp_logits.shape[-2])
+            aux = mtp_loss(output.mtp_logits, mtp_targets)
             loss = loss + mtp_weight * aux
             values["mtp_loss"] = float(aux.detach())
+            values["mtp_status"] = "trained"
+        else:
+            if "mtp_target_ids" in batch:
+                raise ValueError("batch 提供了 mtp_target_ids，但当前路径没有 general/MTP 阶段。")
+            values["mtp_status"] = "not_applicable:no_general_stage"
         balance = load_balance_loss(
             output.router.domain_logits.reshape(-1, layer.config.num_domains),
             layer.config.num_domains,

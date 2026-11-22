@@ -132,6 +132,18 @@ class NoildLayer(nn.Module):
         """负载大时扩大重判间隔 N（供调用方按负载调用）。"""
         return self.rejudge.update_load(load_factor)
 
+    def mark_router_uncertainty_calibrated(self, calibrated: bool = True) -> None:
+        """只在已训练路由器的验证集校准后启用熵阈值提前重判。"""
+        self.config.router_uncertainty_calibrated = bool(calibrated)
+        self.router.calibrated = bool(calibrated)
+
+    def reset_generation_state(self) -> None:
+        """清除跨请求的路由缓存；新会话开始时供集成层调用。"""
+        self._cached_router = None
+        self.rejudge.last_rejudge_step = -10**9
+        self.rejudge.last_uncertainty_rejudge_step = -10**9
+        self.rejudge.last_hidden = None
+
     def close(self, wait_for_expert_io: bool = True) -> None:
         """等待并释放专家搬运工作线程。"""
         if self.loading is not None:
@@ -236,10 +248,7 @@ class NoildLayer(nn.Module):
             self._active_device = hidden.device
         # step=0 表示新请求的首个输入：丢弃上一请求的缓存，保证每次用户输入必判。
         if not self.training and step == 0 and self._cached_router is not None:
-            self._cached_router = None
-            self.rejudge.last_rejudge_step = -10**9
-            self.rejudge.last_uncertainty_rejudge_step = -10**9
-            self.rejudge.last_hidden = None
+            self.reset_generation_state()
         # 生成中按节奏重判，间隔内复用缓存；按序列池化并保留 batch 维。
         pooled = hidden.mean(dim=-2) if hidden.dim() > 2 else hidden
         if domain_hint is not None:
@@ -274,7 +283,9 @@ class NoildLayer(nn.Module):
         else:
             # 用缓存路由的熵做不确定度触发（不确定度高时提前重判）
             should, why = self.rejudge.should_rejudge(
-                step, entropy=self._cached_router.entropy, hidden=hidden
+                step,
+                entropy=self._cached_router.entropy if self.router.calibrated else None,
+                hidden=hidden,
             )
             if should:
                 pooled_router = self.router.judge_user_input(pooled)

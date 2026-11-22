@@ -76,10 +76,12 @@ class TestMemoryCompression(unittest.TestCase):
         segs = split_segments(text)
         self.assertGreaterEqual(len(segs), 2)
         segs[0].protected = True
-        comp = SelectiveMemoryCompressor(enabled=True, low_score_threshold=10.0)
+        segs[1].summary = "缩写"
+        comp = SelectiveMemoryCompressor(enabled=True, low_score_threshold=1.0)
         out = comp.compress(segs)
         # 受保护片段不压缩（原文保留），非保护低分片段被替换
         self.assertEqual(out[0].text, segs[0].text)
+        self.assertEqual(out[1].text, "缩写")
 
     def test_threshold_and_ablation(self):
         comp = SelectiveMemoryCompressor(threshold_ratio=0.5, max_context_len=100)
@@ -91,6 +93,13 @@ class TestMemoryCompression(unittest.TestCase):
         segs = split_segments("这是一段很长的上下文内容。\n" * 5)
         report = comp.ablation(segs)
         self.assertIn("saved_ratio", report)
+
+    def test_compression_never_expands_short_segments_and_validates_limits(self):
+        with self.assertRaisesRegex(ValueError, "max_context_len"):
+            SelectiveMemoryCompressor(max_context_len=0)
+        comp = SelectiveMemoryCompressor(low_score_threshold=1.0)
+        short = [Segment("x")]
+        self.assertEqual(comp.compress(short)[0].text, "x")
 
     def test_scoring_head_trains_on_real_features_and_requires_them_at_inference(self):
         head = ScoringHead(hidden_size=8)
@@ -120,6 +129,14 @@ class TestMemoryCompression(unittest.TestCase):
 
 
 class TestProtectedZone(unittest.TestCase):
+    def test_invalid_reinjection_and_memory_limits_rejected(self):
+        with self.assertRaisesRegex(ValueError, "reinject_every"):
+            InstructionAnchor(reinject_every=0)
+        with self.assertRaisesRegex(ValueError, "容量"):
+            ThinkingMemoryBlock(capacity=0)
+        with self.assertRaisesRegex(ValueError, "最小更新间隔"):
+            ThinkingMemoryBlock(min_interval=-1)
+
     def test_persona_and_instruction(self):
         zone = ProtectedZone(
             persona_text="冷静的助手",

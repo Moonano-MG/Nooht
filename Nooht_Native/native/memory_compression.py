@@ -161,6 +161,12 @@ class SelectiveMemoryCompressor:
         scoring_head: ScoringHead | None = None,
         anchor_keywords: set[str] | None = None,
     ):
+        if not 0 < threshold_ratio <= 1:
+            raise ValueError("threshold_ratio 必须位于 (0, 1]。")
+        if max_context_len <= 0:
+            raise ValueError("max_context_len 必须为正数。")
+        if not 0 <= low_score_threshold <= 1:
+            raise ValueError("low_score_threshold 必须位于 [0, 1]。")
         self.threshold_ratio = threshold_ratio
         self.max_context_len = max_context_len
         self.enabled = enabled
@@ -215,7 +221,10 @@ class SelectiveMemoryCompressor:
                 out.append(seg)
             elif seg.score < self.low_score_threshold:
                 summary = seg.summary or extractive_summary(seg.text)
-                out.append(Segment(text=summary, score=seg.score, protected=False))
+                # Never expand context: a rule summary that does not save space
+                # is not a compression and can silently worsen the token budget.
+                replacement = summary if len(summary) < len(seg.text) else seg.text
+                out.append(Segment(text=replacement, score=seg.score, protected=False))
             else:
                 out.append(seg)
         return out
@@ -227,9 +236,15 @@ class SelectiveMemoryCompressor:
         """开启与关闭的消融对比：返回压缩前后长度与片段数。"""
         before = self.assemble(segments)
         saved_enabled = self.enabled
-        self.enabled = True
-        after = self.assemble(self.compress(list(segments)))
-        self.enabled = saved_enabled
+        try:
+            self.enabled = True
+            fresh_segments = [
+                Segment(s.text, score=s.score, protected=s.protected, summary=s.summary)
+                for s in segments
+            ]
+            after = self.assemble(self.compress(fresh_segments))
+        finally:
+            self.enabled = saved_enabled
         return {
             "before_chars": len(before),
             "after_chars": len(after),
