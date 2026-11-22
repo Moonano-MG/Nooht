@@ -5,6 +5,11 @@ name: train-noild
 # Hard limit: job timeout 60 min; the script also stops training after --max_minutes (45).
 
 on:
+  push:
+    branches: [v0.1.0-dev, arena/9241b18b-nooht]
+    paths:
+      - "scripts/pair_train/**"
+      - ".github/workflows/train-noild.yml"
   workflow_dispatch:
     inputs:
       steps:

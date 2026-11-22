@@ -3,7 +3,7 @@ name: build-linux
 on:
   workflow_dispatch:
   push:
-    branches: [v0.1.0-dev]
+    branches: [v0.1.0-dev, arena/9241b18b-nooht]
   pull_request:
     branches: [v0.1.0-dev]
 
