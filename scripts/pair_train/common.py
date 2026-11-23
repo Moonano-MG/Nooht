@@ -1,9 +1,12 @@
 """Model construction shared by Native and Noild pair training.
 
-Native: plain Jamba (transformers implementation), 4 layers, hidden 128, 4 experts.
-Noild:  the same Jamba, with the 2 MoE feed_forward blocks replaced by NoildLayer.
-Parameter-matched: Native 1,369,776; Noild 1,368,752 (gap 0.075%) with intermediate=72,
-draft hidden=96, draft intermediate=208. Noild's general experts are only built on paths that use them.
+Native: plain Jamba (transformers implementation), 4 experts per MoE block.
+Noild:  the same Jamba, with every MoE feed_forward block replaced by NoildLayer.
+
+Two parameter-matched sizes:
+  small  : 4 layers, hidden 128. Native 1,369,776 params; Noild 1,368,752 (gap 0.075%).
+  medium : 8 layers, hidden 256, 8 experts. Native 16,787,840 params; Noild 16,783,744 (gap 0.024%).
+Noild general experts are only built on paths that use them (Veronoo Tutti does not).
 """
 from __future__ import annotations
 
@@ -18,19 +21,26 @@ sys.path.insert(0, str(REPO_ROOT / "Noild"))
 
 from noild import NoildConfig, NoildLayer, get_cascade_path  # noqa: E402
 
-H, L, V = 128, 4, 256  # hidden size, layers, byte-level vocab
-NOILD_INTER = 72
-NOILD_DRAFT_HIDDEN = 96
-NOILD_DRAFT_INTER = 208
-EXPECTED_NATIVE_PARAMS = 1369776
+V = 256  # byte-level vocab
+SIZES: dict[str, dict] = {
+    "small": dict(
+        hidden=128, layers=4, heads=4, kv_heads=2, native_inter=256, experts=4,
+        noild_inter=72, draft_hidden=96, draft_inter=208, native_params=1369776,
+    ),
+    "medium": dict(
+        hidden=256, layers=8, heads=8, kv_heads=4, native_inter=512, experts=8,
+        noild_inter=512, draft_hidden=224, draft_inter=832, native_params=16787840,
+    ),
+}
 MAX_PARAM_GAP = 0.001  # Noild must be within 0.1% of Native
 
 
-def jamba_cfg(inter: int = 256) -> JambaConfig:
+def jamba_cfg(size: dict) -> JambaConfig:
     return JambaConfig(
-        vocab_size=V, hidden_size=H, intermediate_size=inter, num_hidden_layers=L,
-        num_attention_heads=4, num_key_value_heads=2, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2,
-        num_experts=4, num_experts_per_tok=2, attn_layer_offset=1, attn_layer_period=2,
+        vocab_size=V, hidden_size=size["hidden"], intermediate_size=size["native_inter"],
+        num_hidden_layers=size["layers"], num_attention_heads=size["heads"],
+        num_key_value_heads=size["kv_heads"], mamba_d_state=8, mamba_d_conv=4, mamba_expand=2,
+        num_experts=size["experts"], num_experts_per_tok=2, attn_layer_offset=1, attn_layer_period=2,
         expert_layer_offset=1, expert_layer_period=2, max_position_embeddings=512,
     )
 
@@ -56,16 +66,20 @@ class NoildFF(torch.nn.Module):
         return out.hidden
 
 
-def build(arch: str, seed: int):
+def build(arch: str, seed: int, size_name: str):
+    if size_name not in SIZES:
+        raise ValueError(f"unknown size {size_name}; choose from {sorted(SIZES)}")
+    size = SIZES[size_name]
     torch.manual_seed(seed)
-    model = JambaForCausalLM(jamba_cfg(256))
+    model = JambaForCausalLM(jamba_cfg(size))
     if arch == "native":
         return model, []
     if arch != "noild":
         raise ValueError(arch)
     ncfg = NoildConfig(
-        hidden_size=H, intermediate_size=NOILD_INTER, vocab_size=V, num_domains=4,
-        num_general_experts=2, draft_hidden_size=NOILD_DRAFT_HIDDEN, draft_intermediate_size=NOILD_DRAFT_INTER,
+        hidden_size=size["hidden"], intermediate_size=size["noild_inter"], vocab_size=V,
+        num_domains=4, num_general_experts=2,
+        draft_hidden_size=size["draft_hidden"], draft_intermediate_size=size["draft_inter"],
     )
     wraps = []
     for layer in model.model.layers:
@@ -73,6 +87,6 @@ def build(arch: str, seed: int):
             wrap = NoildFF(ncfg)
             layer.feed_forward = wrap
             wraps.append(wrap)
-    if len(wraps) != 2:
-        raise RuntimeError(f"expected 2 MoE blocks to replace, got {len(wraps)}")
+    if not wraps:
+        raise RuntimeError("no MoE blocks found to replace")
     return model, wraps

@@ -2,6 +2,7 @@ name: train-noild
 
 # Same-budget pair training, Noild side (Jamba with 2 MoE blocks replaced by NoildLayer).
 # Seeds 0, 1, 2 run as parallel jobs. A newer push cancels the older in-progress run of the same seed.
+# Model: medium (8 layers, hidden 256, 8 experts, ~16.8M params), 3000 steps.
 # Hard limit: job timeout 60 min; the script also stops training after --max_minutes (45).
 
 on:
@@ -15,7 +16,7 @@ on:
       steps:
         description: "training steps (must match train-native)"
         required: false
-        default: "2000"
+        default: "3000"
 
 permissions:
   contents: read
@@ -32,7 +33,7 @@ jobs:
       group: train-noild-seed${{ matrix.seed }}-${{ github.ref }}
       cancel-in-progress: true
     env:
-      STEPS: ${{ inputs.steps || '2000' }}
+      STEPS: ${{ inputs.steps || '3000' }}
       SEED: ${{ matrix.seed }}
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +55,7 @@ jobs:
         run: |
           set -o pipefail
           python -W ignore scripts/pair_train/train.py \
-            --arch noild --seed "$SEED" --steps "$STEPS" --eval_every 100 \
+            --arch noild --size medium --seed "$SEED" --steps "$STEPS" --eval_every 100 \
             --corpus train-out/corpus.bin --threads "$(nproc)" --max_minutes 45 \
             --out train-out/res_noild_s${SEED}.json 2>&1 | tee train-out/log_noild_s${SEED}.txt
 

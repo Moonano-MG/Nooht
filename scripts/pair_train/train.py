@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from common import EXPECTED_NATIVE_PARAMS, MAX_PARAM_GAP, NOILD_INTER, V, build
+from common import MAX_PARAM_GAP, SIZES, V, build
 from noild.training import load_balance_loss
 
 K = 4  # draft_num_tokens (Noild draft head predicts t+1..t+K)
@@ -23,6 +23,7 @@ K = 4  # draft_num_tokens (Noild draft head predicts t+1..t+K)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", choices=["native", "noild"], required=True)
+    ap.add_argument("--size", choices=sorted(SIZES), default="medium")
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--steps", type=int, default=1200)
@@ -51,12 +52,13 @@ def main() -> int:
 
     VAL = sample(val_d, torch.Generator().manual_seed(1234), 128)  # identical for both arches
 
-    model, wraps = build(args.arch, args.seed)
+    model, wraps = build(args.arch, args.seed, args.size)
+    expected = SIZES[args.size]["native_params"]
     n_params = sum(p.numel() for p in model.parameters())
-    if args.arch == "native" and n_params != EXPECTED_NATIVE_PARAMS:
-        raise RuntimeError(f"native param mismatch: {n_params} != {EXPECTED_NATIVE_PARAMS}")
-    if args.arch == "noild" and abs(n_params - EXPECTED_NATIVE_PARAMS) / EXPECTED_NATIVE_PARAMS > MAX_PARAM_GAP:
-        raise RuntimeError(f"noild param gap too large: {n_params} vs {EXPECTED_NATIVE_PARAMS}")
+    if args.arch == "native" and n_params != expected:
+        raise RuntimeError(f"native param mismatch: {n_params} != {expected}")
+    if args.arch == "noild" and abs(n_params - expected) / expected > MAX_PARAM_GAP:
+        raise RuntimeError(f"noild param gap too large: {n_params} vs {expected}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     gen = torch.Generator().manual_seed(args.seed)
 
@@ -87,7 +89,7 @@ def main() -> int:
         res = {
             "arch": args.arch, "seed": args.seed, "params": n_params, "steps_requested": args.steps,
             "steps_done": log[-1]["step"], "finished": final and status == "completed", "status": status,
-            "noild_intermediate": NOILD_INTER if wraps else None, "batch": args.batch, "seq": args.seq,
+            "size": args.size, "noild_intermediate": SIZES[args.size]["noild_inter"] if wraps else None, "batch": args.batch, "seq": args.seq,
             "lr": args.lr, "wall_s": round(time.time() - t0, 1), "final_val": log[-1]["val_loss"],
             "best_val": best["val_loss"], "best_step": best["step"], "log": log,
             "torch": torch.__version__,
