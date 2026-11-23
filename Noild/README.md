@@ -24,7 +24,7 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 - Soleinoo Max/Plus：路由 > 预生成 > 通用 > 垂直 > 合并 > 通用 > 输出（末尾通用专家润色）
 - Soleinoo Flash：路由 > 预生成 > 通用 > 垂直 > 合并 > 输出
 
-路径由 `noild.config.get_cascade_path(model, tier)` 给出，`NoildLayer` 按路径串联执行。
+路径由 `noild.config.get_cascade_path(model, tier)` 给出，`NoildLayer` 按路径串联执行。推理路由缓存会检查池化 batch 形状与设备，并在路由状态锁内处理请求切换；可传入稳定的 `request_id` 在请求变化时自动失效缓存。缓存只保留一个活跃请求，交错使用多个 ID 时会重新路由但不会串用。未传 ID 时，每个新请求必须以 `step=0` 开始或调用 `reset_generation_state()`；单纯相同 batch size、非零 step 的新请求无法由层自动辨认。
 
 ## 加载策略（基础版）
 

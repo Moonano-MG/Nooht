@@ -23,6 +23,8 @@ identical data, validation set, seed, steps, batch, sequence length and optimize
   uses intermediate 72, draft hidden 96, draft intermediate 208 (1,368,752 parameters, gap 0.075%).
 - `train.py` writes its JSON after every evaluation, so a run stopped by `--max_minutes` still
   leaves completed results. The `status` field records `completed` or `stopped_time_limit`.
+  Independent Noild evaluation batches reset each adapter's public generation state rather than
+  mutating its private router cache.
 
 Run locally (CPU):
 

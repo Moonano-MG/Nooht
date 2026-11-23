@@ -68,6 +68,7 @@ class NoildLayer(nn.Module):
         self._offload_device = torch.device(offload_device) if offload_device is not None else None
         self._active_device: torch.device | None = None
         self._module_io_lock = threading.RLock()
+        self._router_state_lock = threading.RLock()
         self.path: tuple[str, ...] = (
             path if path is not None else get_cascade_path("veronoo", "tutti")
         )
@@ -103,8 +104,9 @@ class NoildLayer(nn.Module):
             if use_loading
             else None
         )
-        # 路由缓存（池化级）：重判间隔内复用，不每步重判
+        # 路由缓存（池化级）：重判间隔内复用，不每步重判；缓存只允许同请求/同池化批形状使用。
         self._cached_router: RouterOutput | None = None
+        self._cache_request_id: str | int | None = None
         self._loading_clock = 0  # 单调加载时钟，不随新请求的 generation step 归零
 
     def _module_for_expert(self, expert_id: str) -> nn.Module:
@@ -137,12 +139,89 @@ class NoildLayer(nn.Module):
         self.config.router_uncertainty_calibrated = bool(calibrated)
         self.router.calibrated = bool(calibrated)
 
-    def reset_generation_state(self) -> None:
-        """清除跨请求的路由缓存；新会话开始时供集成层调用。"""
-        self._cached_router = None
-        self.rejudge.last_rejudge_step = -10**9
-        self.rejudge.last_uncertainty_rejudge_step = -10**9
-        self.rejudge.last_hidden = None
+    def reset_generation_state(self, request_id: str | int | None = None) -> None:
+        """清除跨请求路由缓存；也可指定接下来请求的 ID。"""
+        with self._router_state_lock:
+            self._cached_router = None
+            self._cache_request_id = request_id
+            self.rejudge.last_rejudge_step = -10**9
+            self.rejudge.last_uncertainty_rejudge_step = -10**9
+            self.rejudge.last_hidden = None
+
+    def _router_cache_matches(self, pooled: torch.Tensor) -> bool:
+        """检查缓存路由是否与当前池化张量的前导形状和设备兼容。"""
+        cached = self._cached_router
+        return bool(
+            cached is not None
+            and cached.domain_ids.shape[:-1] == pooled.shape[:-1]
+            and cached.domain_logits.shape[:-1] == pooled.shape[:-1]
+            and cached.entropy.shape == pooled.shape[:-1]
+            and cached.domain_ids.device == pooled.device
+        )
+
+    def _resolve_router(
+        self,
+        hidden: torch.Tensor,
+        pooled: torch.Tensor,
+        step: int,
+        domain_hint: torch.Tensor | None,
+        request_id: str | int | None,
+    ) -> tuple[RouterOutput, str]:
+        """Resolve this call's route atomically so interleaved requests cannot share state."""
+        with self._router_state_lock:
+            if not self.training:
+                request_changed = request_id != self._cache_request_id
+                if request_changed or step == 0:
+                    self.reset_generation_state(request_id=request_id)
+            if domain_hint is not None:
+                pooled_router = self.router.judge_user_input(pooled)
+                hint = torch.as_tensor(domain_hint, device=pooled.device, dtype=torch.long)
+                hint = hint.clamp(0, self.config.num_domains - 1)
+                if hint.ndim == 0:
+                    hint = hint.expand(pooled.shape[:-1])
+                hint = hint.expand(pooled.shape[:-1])
+                ids = torch.cat(
+                    (hint.unsqueeze(-1), pooled_router.domain_ids[..., 1:]), dim=-1
+                )
+                weights = pooled_router.top_weights.clone()
+                weights[..., 0] = 1.0
+                if weights.shape[-1] > 1:
+                    weights[..., 1:] = 0.0
+                pooled_router = RouterOutput(
+                    ids, pooled_router.domain_logits, pooled_router.entropy, weights
+                )
+                self._cached_router = None if self.training else self._detach_router(pooled_router)
+                self.rejudge.mark_rejudged(step, hidden)
+                return pooled_router, "hint"
+            if self.training:
+                # Training routes each batch afresh and never persists inference cache state.
+                pooled_router = self.router.judge_user_input(pooled)
+                self._cached_router = None
+                self.rejudge.mark_rejudged(step, hidden)
+                return pooled_router, "train"
+            if self._cached_router is not None and not self._router_cache_matches(pooled):
+                # Batch size/leading shape or device changed; do not broadcast stale route IDs.
+                pooled_router = self.router.judge_user_input(pooled)
+                self._cached_router = self._detach_router(pooled_router)
+                self.rejudge.mark_rejudged(step, hidden)
+                return pooled_router, "cache_mismatch"
+            if self._cached_router is None:
+                pooled_router = self.router.judge_user_input(pooled)
+                self._cached_router = self._detach_router(pooled_router)
+                self.rejudge.mark_rejudged(step, hidden)
+                return pooled_router, "first"
+
+            should, why = self.rejudge.should_rejudge(
+                step,
+                entropy=self._cached_router.entropy if self.router.calibrated else None,
+                hidden=hidden,
+            )
+            if should:
+                pooled_router = self.router.judge_user_input(pooled)
+                self._cached_router = self._detach_router(pooled_router)
+                self.rejudge.mark_rejudged(step, hidden)
+                return pooled_router, why
+            return self._cached_router, "cached"
 
     def close(self, wait_for_expert_io: bool = True) -> None:
         """等待并释放专家搬运工作线程。"""
@@ -230,6 +309,7 @@ class NoildLayer(nn.Module):
         step: int = 0,
         domain_hint: torch.Tensor | None = None,
         return_aux_logits: bool | None = None,
+        request_id: str | int | None = None,
     ) -> NoildOutput:
         """串联执行。
 
@@ -239,6 +319,8 @@ class NoildLayer(nn.Module):
             domain_hint: 可选外部领域提示；提供时强制领域选择并更新路由缓存。
             return_aux_logits: 默认训练时计算 draft/MTP logits，推理时跳过未用辅助大词表头；
                 可显式开启以用于验证/消融。
+            request_id: 可选请求标识；同一生成请求的每次 forward 传相同 ID，变化时自动清空缓存。
+                不传时应以 step=0 开始新请求，或显式调用 reset_generation_state()。
         """
         if self._offload_device is not None:
             if self.training or torch.is_grad_enabled():
@@ -246,55 +328,11 @@ class NoildLayer(nn.Module):
             if self._active_device is not None and hidden.device != self._active_device:
                 raise RuntimeError("offload_device 模式不支持同一层在多个目标设备间切换。")
             self._active_device = hidden.device
-        # step=0 表示新请求的首个输入：丢弃上一请求的缓存，保证每次用户输入必判。
-        if not self.training and step == 0 and self._cached_router is not None:
-            self.reset_generation_state()
-        # 生成中按节奏重判，间隔内复用缓存；按序列池化并保留 batch 维。
+        # 路由决策在锁内完成：共享层实例上的交错请求不会相互读取或覆盖未完成的状态。
         pooled = hidden.mean(dim=-2) if hidden.dim() > 2 else hidden
-        if domain_hint is not None:
-            pooled_router = self.router.judge_user_input(pooled)
-            hint = torch.as_tensor(domain_hint, device=pooled.device, dtype=torch.long)
-            hint = hint.clamp(0, self.config.num_domains - 1)
-            if hint.ndim == 0:
-                hint = hint.expand(pooled.shape[:-1])
-            hint = hint.expand(pooled.shape[:-1])
-            ids = torch.cat(
-                (hint.unsqueeze(-1), pooled_router.domain_ids[..., 1:]), dim=-1
-            )
-            weights = pooled_router.top_weights.clone()
-            weights[..., 0] = 1.0
-            if weights.shape[-1] > 1:
-                weights[..., 1:] = 0.0
-            pooled_router = RouterOutput(ids, pooled_router.domain_logits, pooled_router.entropy, weights)
-            self._cached_router = self._detach_router(pooled_router)
-            self.rejudge.mark_rejudged(step, hidden)
-            reason = "hint"
-        elif self.training:
-            # 训练中每步重新算路由并保留梯度；生成推理才应用节奏缓存。
-            pooled_router = self.router.judge_user_input(pooled)
-            self._cached_router = self._detach_router(pooled_router)
-            self.rejudge.mark_rejudged(step, hidden)
-            reason = "train"
-        elif self._cached_router is None:
-            pooled_router = self.router.judge_user_input(pooled)
-            self._cached_router = self._detach_router(pooled_router)
-            self.rejudge.mark_rejudged(step, hidden)
-            reason = "first"
-        else:
-            # 用缓存路由的熵做不确定度触发（不确定度高时提前重判）
-            should, why = self.rejudge.should_rejudge(
-                step,
-                entropy=self._cached_router.entropy if self.router.calibrated else None,
-                hidden=hidden,
-            )
-            if should:
-                pooled_router = self.router.judge_user_input(pooled)
-                self._cached_router = self._detach_router(pooled_router)
-                self.rejudge.mark_rejudged(step, hidden)
-                reason = why
-            else:
-                pooled_router = self._cached_router
-                reason = "cached"
+        pooled_router, reason = self._resolve_router(
+            hidden, pooled, step, domain_hint, request_id
+        )
         # 路由按序列池化判定，垂直/适配器按 token 执行：把领域广播到 token 级
         # 注意：广播产生新对象，不修改缓存（缓存保持池化级形状）
         router_out = RouterOutput(
@@ -304,8 +342,8 @@ class NoildLayer(nn.Module):
             top_weights=pooled_router.top_weights,
         )
         if router_out.domain_ids.dim() < hidden.dim():
-            ids = router_out.domain_ids.unsqueeze(1)
-            w = router_out.top_weights.unsqueeze(1)
+            ids = router_out.domain_ids.unsqueeze(-2)
+            w = router_out.top_weights.unsqueeze(-2)
             target = hidden.shape[:-1] + (ids.shape[-1],)
             router_out.domain_ids = ids.expand(target)
             router_out.top_weights = w.expand(target)

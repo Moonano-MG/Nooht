@@ -247,6 +247,41 @@ class TestLayer(unittest.TestCase):
         self.assertEqual(calls, 3)
         self.assertEqual(new_request.rejudge_reason, "first")
 
+    def test_router_cache_rejects_changed_batch_and_request(self):
+        cfg = small_config(router_rejudge_interval=100)
+        layer = NoildLayer(cfg, path=("router",), use_loading=False).eval()
+        calls = 0
+        original = layer.router.judge_user_input
+
+        def counted(hidden):
+            nonlocal calls
+            calls += 1
+            return original(hidden)
+
+        layer.router.judge_user_input = counted
+        first = layer(torch.randn(2, 3, cfg.hidden_size), step=4, request_id="request-a")
+        self.assertEqual(first.rejudge_reason, "first")
+        changed_batch = layer(
+            torch.randn(3, 3, cfg.hidden_size), step=5, request_id="request-a"
+        )
+        self.assertEqual(changed_batch.rejudge_reason, "cache_mismatch")
+        self.assertEqual(changed_batch.hidden.shape, (3, 3, cfg.hidden_size))
+        self.assertEqual(calls, 2)
+        changed_request = layer(
+            torch.randn(3, 3, cfg.hidden_size), step=6, request_id="request-b"
+        )
+        self.assertEqual(changed_request.rejudge_reason, "first")
+        self.assertEqual(calls, 3)
+
+    def test_training_route_is_not_reused_by_eval(self):
+        cfg = small_config()
+        layer = NoildLayer(cfg, path=("router",), use_loading=False)
+        layer(torch.randn(2, 3, cfg.hidden_size), step=1)
+        self.assertIsNone(layer._cached_router)
+        layer.eval()
+        out = layer(torch.randn(2, 3, cfg.hidden_size), step=10)
+        self.assertEqual(out.rejudge_reason, "first")
+
     def test_uncertain_untrained_router_is_throttled(self):
         cfg = small_config(router_rejudge_interval=4)
         layer = NoildLayer(cfg, path=("router",), use_loading=False).eval()

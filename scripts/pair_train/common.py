@@ -44,6 +44,11 @@ class NoildFF(torch.nn.Module):
         self.last = None
         self.step = 0
 
+    def reset_generation(self):
+        """Start a fresh eval request without retaining route state from prior batches."""
+        self.step = 0
+        self.noild.reset_generation_state()
+
     def forward(self, hidden_states):
         out = self.noild(hidden_states, step=self.step)
         self.step += 1
