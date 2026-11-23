@@ -66,10 +66,9 @@ def main() -> int:
         tot, n = 0.0, 0
         for i in range(0, VAL.shape[0], 16):
             x = VAL[i:i + 16]
-            # Noild's inference route cache is not keyed by batch/request (known issue, see report):
-            # clear it before every independent evaluation batch so each batch is routed fresh.
+            # Validation batches are independent requests; reset router state via the public adapter API.
             for w in wraps:
-                w.noild._cached_router = None
+                w.reset_generation()
             logits = model(input_ids=x[:, :args.seq]).logits
             tgt = x[:, 1:args.seq + 1]
             tot += float(F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1), reduction="sum"))
