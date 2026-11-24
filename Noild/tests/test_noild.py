@@ -4,6 +4,7 @@
 （在仓库根目录执行；Noild/ 需在 PYTHONPATH 上，测试内已处理）
 """
 
+import math
 import os
 import sys
 import threading
@@ -27,7 +28,7 @@ from noild import (
     upcycle_init,
     verify_draft,
 )
-from noild.experts import ExpertMLP, MergeExpert
+from noild.experts import DraftExpert, ExpertMLP, MergeExpert
 from noild.loading import ExpertHeatManager
 from noild.router import DomainRouter, RejudgeController
 
@@ -132,7 +133,44 @@ class TestIntegrationAdapters(unittest.TestCase):
             install_noild_on_qwen_mlp_modules(model, small_config(), [])
 
 
+class TestDraftInitialization(unittest.TestCase):
+    def test_initial_draft_logits_are_uniform_and_head_trains(self):
+        cfg = small_config()
+        expert = DraftExpert(cfg)
+        _, logits = expert(torch.randn(2, 3, cfg.hidden_size))
+        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
+        labels = torch.randint(cfg.vocab_size, logits.shape[:-1])
+        loss = draft_loss(logits, labels)
+        self.assertAlmostEqual(float(loss), math.log(cfg.vocab_size), places=5)
+        loss.backward()
+        grad = expert.draft_head.weight.grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertGreater(float(grad.abs().sum()), 0.0)
+
+
 class TestRouter(unittest.TestCase):
+    def test_nonconsecutive_steps_clear_cache_without_request_id(self):
+        cfg = small_config(router_rejudge_interval=100)
+        layer = NoildLayer(cfg, path=("router",), use_loading=False).eval()
+        calls = 0
+        original = layer.router.judge_user_input
+
+        def counted(hidden):
+            nonlocal calls
+            calls += 1
+            return original(hidden)
+
+        layer.router.judge_user_input = counted
+        hidden = torch.randn(2, 3, cfg.hidden_size)
+        layer(hidden, step=5)
+        next_request = layer(hidden, step=7)
+        self.assertEqual(next_request.rejudge_reason, "first")
+        self.assertEqual(calls, 2)
+        continuation = layer(hidden, step=8)
+        self.assertEqual(continuation.rejudge_reason, "cached")
+        self.assertEqual(calls, 2)
+
     def test_rejudge_controller_constructs_under_meta_context(self):
         with torch.device("meta"):
             controller = RejudgeController(small_config())
@@ -299,7 +337,7 @@ class TestLayer(unittest.TestCase):
             layer(x, step=step)
         self.assertEqual(calls, 13)  # 未校准时仅按 interval 重判，不由随机熵触发
         layer.mark_router_uncertainty_calibrated()
-        out = layer(x, step=49)
+        out = layer(x, step=50)
         self.assertEqual(out.rejudge_reason, "uncertainty")
         self.assertEqual(calls, 14)  # 计数为累计值：此前 13 次 interval 重判 + 校准后 1 次不确定性重判
 
@@ -482,6 +520,30 @@ class TestLayer(unittest.TestCase):
         )
         self.assertIn("draft_loss", auto_history[0])
         self.assertIn("mtp_loss", auto_history[0])
+
+    def test_train_noild_errors_when_enabled_auxiliary_logits_are_missing(self):
+        cfg = small_config()
+        batch = {
+            "hidden": torch.randn(2, 3, cfg.hidden_size),
+            "target_ids": torch.randint(cfg.vocab_size, (2, 3)),
+        }
+        for path, field, message in (
+            (("router", "draft"), "draft_logits", "draft_logits"),
+            (("router", "general"), "mtp_logits", "mtp_logits"),
+        ):
+            layer = NoildLayer(cfg, path=path, use_loading=False)
+            original_forward = layer.forward
+
+            def without_aux(*args, _forward=original_forward, _field=field, **kwargs):
+                output = _forward(*args, **kwargs)
+                setattr(output, _field, None)
+                return output
+
+            layer.forward = without_aux
+            head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size)
+            optimizer = torch.optim.AdamW(list(layer.parameters()) + list(head.parameters()), lr=1e-3)
+            with self.assertRaisesRegex(RuntimeError, message):
+                train_noild(layer, head, [batch], optimizer)
 
     def test_tutti_records_mtp_not_applicable_and_rejects_stray_mtp_targets(self):
         cfg = small_config()
