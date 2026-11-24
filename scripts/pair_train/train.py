@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from common import MAX_PARAM_GAP, SIZES, V, build
-from noild.training import load_balance_loss
+from noild.training import load_balance_loss, mean_layer_losses
 
 K = 4  # draft_num_tokens (Noild draft head predicts t+1..t+K)
 
@@ -89,8 +89,12 @@ def main() -> int:
         res = {
             "arch": args.arch, "seed": args.seed, "params": n_params, "steps_requested": args.steps,
             "steps_done": log[-1]["step"], "finished": final and status == "completed", "status": status,
-            "size": args.size, "noild_intermediate": SIZES[args.size]["noild_inter"] if wraps else None, "batch": args.batch, "seq": args.seq,
-            "lr": args.lr, "wall_s": round(time.time() - t0, 1), "final_val": log[-1]["val_loss"],
+            "size": args.size, "noild_intermediate": SIZES[args.size]["noild_inter"] if wraps else None,
+            "noild_layers": len(wraps), "batch": args.batch, "seq": args.seq,
+            "lr": args.lr, "draft_weight": args.draft_w,
+            "draft_loss_aggregation": "mean_over_layers" if wraps else "not_applicable",
+            "wall_s": round(time.time() - t0, 1),
+            "final_val": log[-1]["val_loss"],
             "best_val": best["val_loss"], "best_step": best["step"], "log": log,
             "torch": torch.__version__,
         }
@@ -111,24 +115,34 @@ def main() -> int:
         lm = F.cross_entropy(logits.reshape(-1, V), batch[:, 1:args.seq + 1].reshape(-1))
         loss = lm
         draft_val = 0.0
+        draft_val_per_layer: list[float] = []
         if wraps:
             # Draft at position t predicts tokens t+1..t+K -> targets (B, L, K)
             tg = torch.stack([batch[:, 1 + k: 1 + k + args.seq] for k in range(K)], dim=-1)
-            dl = 0.0
-            bal = 0.0
+            layer_draft_losses = []
+            layer_balance_losses = []
             for w in wraps:
                 o = w.last
-                if o.draft_logits is not None:
-                    dl = dl + F.cross_entropy(o.draft_logits.reshape(-1, V), tg.reshape(-1))
-                bal = bal + load_balance_loss(o.router.domain_logits.reshape(-1, 4), 4, 0.01)
+                if o.draft_logits is None:
+                    raise RuntimeError("Noild path enabled Draft but returned no draft logits")
+                layer_draft_losses.append(
+                    F.cross_entropy(o.draft_logits.reshape(-1, V), tg.reshape(-1))
+                )
+                layer_balance_losses.append(
+                    load_balance_loss(o.router.domain_logits.reshape(-1, 4), 4, 0.01)
+                )
+            dl = mean_layer_losses(layer_draft_losses)
+            bal = mean_layer_losses(layer_balance_losses)
             loss = loss + args.draft_w * dl + bal
-            draft_val = float(dl)
+            draft_val = float(dl.detach())
+            draft_val_per_layer = [float(value.detach()) for value in layer_draft_losses]
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % args.eval_every == 0 or step == args.steps:
-            rec = {"step": step, "train_lm": round(float(lm), 4), "aux_draft": round(draft_val, 4),
+            rec = {"step": step, "train_lm": round(float(lm), 4),
+                   "aux_draft": round(draft_val, 4), "aux_draft_layers": [round(v, 4) for v in draft_val_per_layer],
                    "grad_norm": round(float(gn), 3), "val_loss": round(evaluate(), 4),
                    "elapsed_s": round(time.time() - t0, 1)}
             log.append(rec)

@@ -172,6 +172,10 @@ class NoildLayer(nn.Module):
         """Resolve this call's route atomically so interleaved requests cannot share state."""
         with self._router_state_lock:
             if not self.training:
+                if request_id is None:
+                    raise ValueError(
+                        "eval 推理必须提供 request_id；新请求不得隐式复用其他请求的路由缓存。"
+                    )
                 request_changed = request_id != self._cache_request_id
                 step_discontinuous = (
                     self._last_inference_step is not None
@@ -326,8 +330,8 @@ class NoildLayer(nn.Module):
             domain_hint: 可选外部领域提示；提供时强制领域选择并更新路由缓存。
             return_aux_logits: 默认训练时计算 draft/MTP logits，推理时跳过未用辅助大词表头；
                 可显式开启以用于验证/消融。
-            request_id: 可选请求标识；同一生成请求的每次 forward 传相同 ID，变化时自动清空缓存。
-                未传 ID 时 step=0 或步数不连续会清空缓存；也可显式调用 reset_generation_state()。
+            request_id: eval 推理必填；同一生成请求的每次 forward 传相同 ID，变化时清空缓存。
+                step=0 或步数不连续也会清空缓存；reset_generation_state() 可显式清空状态。
         """
         if self._offload_device is not None:
             if self.training or torch.is_grad_enabled():

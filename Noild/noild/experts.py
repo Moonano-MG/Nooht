@@ -91,15 +91,13 @@ class DraftExpert(nn.Module):
         self.adapter = DomainAdapter(
             config.draft_hidden_size, config.num_domains, config.draft_adapter_rank
         )
-        self.draft_head = nn.Linear(
-            config.draft_hidden_size,
-            config.vocab_size * config.draft_num_tokens,
-            bias=False,
+        self.draft_head = init_linear_(
+            nn.Linear(
+                config.draft_hidden_size,
+                config.vocab_size * config.draft_num_tokens,
+                bias=False,
+            )
         )
-        # Start with uniform next-token distributions instead of amplifying the
-        # uncalibrated draft MLP activations into very large vocabulary logits.
-        # The head receives nonzero gradients immediately and learns the scale.
-        nn.init.zeros_(self.draft_head.weight)
 
     def forward(
         self,

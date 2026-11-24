@@ -378,6 +378,10 @@ class TestGeneration(unittest.TestCase):
         native_cfg = NativeConfig(noild_enabled=True)
         gen = NativeGenerator(TinyCausalModel(), tokenizer=Tokenizer(), config=native_cfg, noild_layer=layer)
         self.assertEqual(gen.generate("prompt", max_new_tokens=1).steps, 1)
+        first_request_id = layer._cache_request_id
+        self.assertIsInstance(first_request_id, str)
+        self.assertEqual(gen.generate("next prompt", max_new_tokens=1).steps, 1)
+        self.assertNotEqual(layer._cache_request_id, first_request_id)
         with self.assertRaisesRegex(ValueError, "noild_layer"):
             NativeGenerator(TinyCausalModel(), tokenizer=Tokenizer(), config=native_cfg)
 

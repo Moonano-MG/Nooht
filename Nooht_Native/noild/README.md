@@ -25,6 +25,7 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 - Soleinoo Flash：路由 > 预生成 > 通用 > 垂直 > 合并 > 输出
 
 路径由 `noild.config.get_cascade_path(model, tier)` 给出，`NoildLayer` 按路径串联执行。
+eval 推理必须在每次 forward 提供稳定的 `request_id`；缺失时会立即报错，避免隐式复用其他请求的路由缓存。step=0 或步数不连续也会清空缓存；缓存只保留一个活跃请求，交错请求会重新路由而不会串用。
 
 ## 加载策略（基础版）
 
@@ -36,7 +37,7 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 ## 训练方式
 
 各专家共享同一底座（词嵌入加前几层）再分叉训练，最后做对齐微调；
-路由、预生成、合并分阶段联训，加负载约束防止垂直专家被饿死。
+路由、预生成、合并分阶段联训，加负载约束防止垂直专家被饿死。Draft 输出头采用方差保持初始化，训练前应检查 CE 是否接近均匀基线 `ln(vocab_size)`；多层 Noild 的层级辅助 loss 应按层取均值，避免层数改变有效权重。
 见 `noild.training`。
 
 ## 不采用
