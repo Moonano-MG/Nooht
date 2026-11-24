@@ -40,16 +40,18 @@ class NoildJambaFeedForward(nn.Module):
     ):
         super().__init__()
         self.step = step
+        self._request_id = 0
         self.noild = NoildLayer(config, path=get_cascade_path(model, tier))
 
     def reset_generation(self) -> None:
-        """在每个新请求前调用，重置层内路由缓存与步数。"""
+        """在每个新请求前调用，重置路由缓存、请求 ID 和步数。"""
         self.step = 0
-        self.noild.reset_generation_state()
+        self._request_id += 1
+        self.noild.reset_generation_state(request_id=self._request_id)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # JambaSparseMoeBlock 内部会 flatten，这里保持 (B, S, H) 接口不变
-        out = self.noild(hidden_states, step=self.step)
+        out = self.noild(hidden_states, step=self.step, request_id=self._request_id)
         self.step += 1
         return out.hidden
 

@@ -24,7 +24,7 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 - Soleinoo Max/Plus：路由 > 预生成 > 通用 > 垂直 > 合并 > 通用 > 输出（末尾通用专家润色）
 - Soleinoo Flash：路由 > 预生成 > 通用 > 垂直 > 合并 > 输出
 
-路径由 `noild.config.get_cascade_path(model, tier)` 给出，`NoildLayer` 按路径串联执行。推理路由缓存会检查池化 batch 形状与设备，并在路由状态锁内处理请求切换；可传入稳定的 `request_id` 在请求变化时自动失效缓存。缓存只保留一个活跃请求，交错使用多个 ID 时会重新路由但不会串用。未传 ID 时，`step=0` 或相对上一步不连续会使缓存失效；如果新请求恰好以连续的非零 step 开始，调用方仍须传 ID 或调用 `reset_generation_state()`，否则无法从张量本身推断请求边界。
+路径由 `noild.config.get_cascade_path(model, tier)` 给出，`NoildLayer` 按路径串联执行。eval 推理必须在每次 forward 提供稳定的 `request_id`；缺失时会立即报错，不允许隐式复用其他请求的缓存。路由缓存检查池化 batch 形状与设备，且请求切换在锁内处理；step=0 或步数不连续也会清空缓存。缓存只保留一个活跃请求，交错使用多个 ID 时会重新路由但不会串用。
 
 ## 加载策略（基础版）
 
@@ -37,7 +37,7 @@ Noild 全称 **Role-Specialized Cascaded Experts**：专家分角色、串联接
 ## 训练方式
 
 各专家共享同一底座（词嵌入加前几层）再分叉训练，最后做对齐微调；
-路由、预生成、合并分阶段联训，加负载约束防止垂直专家被饿死。Draft 输出头零初始化，使训练初期 logits 为零、loss 从 ln(vocab_size) 起步，随后由辅助损失学习非均匀预测。
+路由、预生成、合并分阶段联训，加负载约束防止垂直专家被饿死。Draft 输出头使用方差保持初始化；训练前应检查其 CE 是否接近均匀基线 `ln(vocab_size)`。同一模型含多个 Noild 层时，训练脚本对层级辅助 loss 求均值，避免因层数变化而改变辅助项的有效权重。
 `train_noild` 从 next-token `target_ids` 自动构造 draft/MTP 未来目标并屏蔽序列尾部无效标签；
 辅助阶段被路径启用但未返回 logits 会报错，未启用阶段会显式记为 not applicable。
 更高预测步采用递减权重（`train_noild` 参数 `draft_horizon_decay`，默认 0.5），默认近端步权重大；这只是训练目标改进，

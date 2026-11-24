@@ -21,6 +21,7 @@ from noild import (
     draft_loss,
     future_token_targets,
     load_balance_loss,
+    mean_layer_losses,
     mtp_loss,
     set_trainable,
     speculative_greedy_decode,
@@ -134,25 +135,44 @@ class TestIntegrationAdapters(unittest.TestCase):
 
 
 class TestDraftInitialization(unittest.TestCase):
-    def test_initial_draft_logits_are_uniform_and_head_trains(self):
-        cfg = small_config()
+    def test_initial_draft_ce_is_near_uniform_baseline_and_backpropagates(self):
+        torch.manual_seed(17)
+        cfg = NoildConfig(
+            hidden_size=256, intermediate_size=72, vocab_size=256, num_domains=4,
+            draft_hidden_size=96, draft_intermediate_size=208,
+        )
         expert = DraftExpert(cfg)
-        _, logits = expert(torch.randn(2, 3, cfg.hidden_size))
-        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
+        _, logits = expert(torch.randn(2, 8, cfg.hidden_size))
         labels = torch.randint(cfg.vocab_size, logits.shape[:-1])
         loss = draft_loss(logits, labels)
-        self.assertAlmostEqual(float(loss), math.log(cfg.vocab_size), places=5)
+        baseline = math.log(cfg.vocab_size)
+        self.assertLess(abs(float(loss) - baseline), 0.5)
         loss.backward()
-        grad = expert.draft_head.weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(torch.isfinite(grad).all())
-        self.assertGreater(float(grad.abs().sum()), 0.0)
+        for parameter in (expert.draft_head.weight, expert.mlp.gate_proj.weight):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+
+    def test_auxiliary_losses_are_averaged_across_layers(self):
+        first = torch.tensor(5.6, requires_grad=True)
+        second = torch.tensor(5.8, requires_grad=True)
+        mean = mean_layer_losses([first, second])
+        self.assertAlmostEqual(float(mean), 5.7, places=5)
+        mean.backward()
+        self.assertAlmostEqual(float(first.grad), 0.5, places=5)
+        self.assertAlmostEqual(float(second.grad), 0.5, places=5)
+        with self.assertRaisesRegex(ValueError, "至少需要一个"):
+            mean_layer_losses([])
 
 
 class TestRouter(unittest.TestCase):
-    def test_nonconsecutive_steps_clear_cache_without_request_id(self):
+    def test_eval_requires_request_id_and_nonconsecutive_steps_clear_cache(self):
         cfg = small_config(router_rejudge_interval=100)
         layer = NoildLayer(cfg, path=("router",), use_loading=False).eval()
+        with self.assertRaisesRegex(ValueError, "必须提供 request_id"):
+            layer(torch.randn(2, 3, cfg.hidden_size), step=0)
+        with self.assertRaisesRegex(ValueError, "必须提供 request_id"):
+            layer(torch.randn(2, 3, cfg.hidden_size), step=1)
         calls = 0
         original = layer.router.judge_user_input
 
@@ -163,11 +183,11 @@ class TestRouter(unittest.TestCase):
 
         layer.router.judge_user_input = counted
         hidden = torch.randn(2, 3, cfg.hidden_size)
-        layer(hidden, step=5)
-        next_request = layer(hidden, step=7)
+        layer(hidden, step=5, request_id="request-a")
+        next_request = layer(hidden, step=7, request_id="request-a")
         self.assertEqual(next_request.rejudge_reason, "first")
         self.assertEqual(calls, 2)
-        continuation = layer(hidden, step=8)
+        continuation = layer(hidden, step=8, request_id="request-a")
         self.assertEqual(continuation.rejudge_reason, "cached")
         self.assertEqual(calls, 2)
 
@@ -250,10 +270,12 @@ class TestLayer(unittest.TestCase):
     def test_inference_skips_unused_auxiliary_logits(self):
         cfg = small_config()
         layer = NoildLayer(cfg, path=("router", "draft", "general"), use_loading=False).eval()
-        out = layer(torch.randn(1, 4, cfg.hidden_size))
+        out = layer(torch.randn(1, 4, cfg.hidden_size), request_id="eval-a")
         self.assertIsNone(out.draft_logits)
         self.assertIsNone(out.mtp_logits)
-        train_out = layer(torch.randn(1, 4, cfg.hidden_size), return_aux_logits=True)
+        train_out = layer(
+            torch.randn(1, 4, cfg.hidden_size), return_aux_logits=True, request_id="eval-a"
+        )
         self.assertIsNotNone(train_out.draft_logits)
         self.assertIsNotNone(train_out.mtp_logits)
 
@@ -273,15 +295,15 @@ class TestLayer(unittest.TestCase):
 
         layer.router.judge_user_input = counted
         x = torch.ones(1, 4, cfg.hidden_size)
-        first = layer(x, step=0)
-        second = layer(x, step=1)
+        first = layer(x, step=0, request_id="conversation-a")
+        second = layer(x, step=1, request_id="conversation-a")
         self.assertEqual(calls, 1)
         self.assertEqual(second.rejudge_reason, "cached")
         self.assertTrue(torch.allclose(first.hidden, second.hidden))
-        third = layer(x, step=2)
+        third = layer(x, step=2, request_id="conversation-a")
         self.assertEqual(calls, 2)
         self.assertEqual(third.rejudge_reason, "interval")
-        new_request = layer(x, step=0)
+        new_request = layer(x, step=0, request_id="conversation-b")
         self.assertEqual(calls, 3)
         self.assertEqual(new_request.rejudge_reason, "first")
 
@@ -317,7 +339,7 @@ class TestLayer(unittest.TestCase):
         layer(torch.randn(2, 3, cfg.hidden_size), step=1)
         self.assertIsNone(layer._cached_router)
         layer.eval()
-        out = layer(torch.randn(2, 3, cfg.hidden_size), step=10)
+        out = layer(torch.randn(2, 3, cfg.hidden_size), step=10, request_id="eval-request")
         self.assertEqual(out.rejudge_reason, "first")
 
     def test_uncertain_untrained_router_is_throttled(self):
@@ -334,10 +356,10 @@ class TestLayer(unittest.TestCase):
         layer.router.judge_user_input = counted
         x = torch.ones(1, 1, cfg.hidden_size)
         for step in range(50):
-            layer(x, step=step)
+            layer(x, step=step, request_id="uncertain-router")
         self.assertEqual(calls, 13)  # 未校准时仅按 interval 重判，不由随机熵触发
         layer.mark_router_uncertainty_calibrated()
-        out = layer(x, step=50)
+        out = layer(x, step=50, request_id="uncertain-router")
         self.assertEqual(out.rejudge_reason, "uncertainty")
         self.assertEqual(calls, 14)  # 计数为累计值：此前 13 次 interval 重判 + 校准后 1 次不确定性重判
 

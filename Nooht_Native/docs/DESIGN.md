@@ -50,7 +50,7 @@ DeepSpeed/FSDP、跨样本 sequence packing、异步 checkpoint 与大规模并�
 ## 7. Noild 可插拔路径
 
 `NoildLayer` 按显式级联路径构造专家；没有 `general` 阶段的路径不再分配通用专家参数。
-通用阶段的专家由对应路径调用。eval 路由缓存校验前导 batch 形状与设备，并在路由状态锁内处理请求切换；可用 `request_id` 区分请求。缓存只保留一个活跃请求，交错请求会重新路由而不会串用。未提供 ID 时需以 `step=0` 开始请求或调用 `reset_generation_state()`。训练时不保留推理缓存。专家加载管理默认只管理状态；若要实际搬运，须显式提供成对的
+通用阶段的专家由对应路径调用。eval 路由缓存校验前导 batch 形状与设备，并在路由状态锁内处理请求切换；每次 eval forward 必须提供稳定的 `request_id`，缺失时立即报错。缓存只保留一个活跃请求，交错请求会重新路由而不会串用；step=0 或步数不连续也会清空缓存。训练时不保留推理缓存。NativeGenerator 会为每次 generate 调用分配请求 ID。专家加载管理默认只管理状态；若要实际搬运，须显式提供成对的
 `preload_expert`/`unload_expert` 回调，回调由串行后台线程执行，前向前通过 `ensure_loaded`
 等待搬运完成；`eval()` + `no_grad()` 推理也可直接设置 `offload_device="cpu"` 使用内置模块迁移。
 未配置搬运时不发生物理搬运。

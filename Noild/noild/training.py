@@ -72,6 +72,20 @@ def set_trainable(layer: NoildLayer, stage: int) -> list[str]:
     return list(plan["trainable"])
 
 
+def mean_layer_losses(losses: Iterable[torch.Tensor]) -> torch.Tensor:
+    """Average scalar auxiliary losses over active Noild layers.
+
+    Keeping the aggregate independent of layer count prevents medium/deep models
+    from receiving a larger effective auxiliary-loss coefficient than small ones.
+    """
+    values = list(losses)
+    if not values:
+        raise ValueError("mean_layer_losses 至少需要一个层级 loss。")
+    if any(not isinstance(value, torch.Tensor) or value.ndim != 0 for value in values):
+        raise ValueError("每个层级 loss 都必须是标量 Tensor。")
+    return torch.stack(values).mean()
+
+
 def upcycle_init(vertical_experts: nn.ModuleList, source_mlp: ExpertMLP) -> None:
     """Upcycling 初始化：把 MoE/共享 MLP 权重复制到各垂直专家。
 

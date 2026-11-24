@@ -53,14 +53,16 @@ class NoildFF(torch.nn.Module):
         self.noild = NoildLayer(cfg, path=get_cascade_path("veronoo", "tutti"))
         self.last = None
         self.step = 0
+        self.request_id = 0
 
     def reset_generation(self):
         """Start a fresh eval request without retaining route state from prior batches."""
         self.step = 0
-        self.noild.reset_generation_state()
+        self.request_id += 1
+        self.noild.reset_generation_state(request_id=self.request_id)
 
     def forward(self, hidden_states):
-        out = self.noild(hidden_states, step=self.step)
+        out = self.noild(hidden_states, step=self.step, request_id=self.request_id)
         self.step += 1
         self.last = out  # keep auxiliary outputs (draft logits, router) for the training loss
         return out.hidden

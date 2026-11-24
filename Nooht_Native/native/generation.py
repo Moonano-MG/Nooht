@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
@@ -177,6 +178,7 @@ class NativeGenerator:
         self, input_ids: torch.Tensor, step: int, past_cache=None,
         cache_arg: str = "past_key_values", use_cache: bool = False,
         cache_position: torch.Tensor | None = None,
+        request_id: int | None = None,
     ):
         kwargs = {"input_ids": input_ids}
         supports_cache, detected_arg = self._cache_call_support()
@@ -206,7 +208,7 @@ class NativeGenerator:
         if output_embeddings is None:
             raise TypeError("Noild 插件需要模型提供 get_output_embeddings() 或 lm_head。")
         transformed = self.noild_layer(
-            hidden_states[-1], step=step, return_aux_logits=False
+            hidden_states[-1], step=step, return_aux_logits=False, request_id=request_id
         )
         return output_embeddings(transformed.hidden), self._extract_cache(output)
 
@@ -256,6 +258,7 @@ class NativeGenerator:
             raise ValueError("max_new_tokens 不得为负。")
         budget = thinking_budget if thinking_budget is not None else self.config.thinking_budget
         limit = max_new_tokens if budget is None else min(max_new_tokens, max(0, budget))
+        request_id = uuid.uuid4().hex
         segments = self.protected_zone.protect_segments(split_segments(prompt_text))
         compressed = False
         if self.compressor.should_compress(self._token_count(prompt_text)):
@@ -297,7 +300,7 @@ class NativeGenerator:
                     )
                     logits, new_cache = self._forward_logits(
                         input_ids, step, past_cache=cache, cache_arg=cache_arg,
-                        use_cache=True, cache_position=positions,
+                        use_cache=True, cache_position=positions, request_id=request_id,
                     )
                     position_cursor += input_ids.shape[1]
                     cache = new_cache
@@ -308,7 +311,7 @@ class NativeGenerator:
                     )
                     logits, cache = self._forward_logits(
                         pending_ids, step, cache_arg=cache_arg, use_cache=True,
-                        cache_position=positions,
+                        cache_position=positions, request_id=request_id,
                     )
                     position_cursor += pending_ids.shape[1]
                     cache_used = cache is not None
@@ -323,7 +326,9 @@ class NativeGenerator:
                         if self.protected_zone.instruction.should_reinject(step):
                             full_context += "\n" + self.protected_zone.instruction.get_anchor_text()
                         input_ids = self._encode(full_context, device)
-                    logits, _ = self._forward_logits(input_ids, step, use_cache=False)
+                    logits, _ = self._forward_logits(
+                        input_ids, step, use_cache=False, request_id=request_id
+                    )
                 if logits.ndim != 3:
                     raise TypeError("model output projection must return (batch, sequence, vocab) logits")
                 next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(device)
