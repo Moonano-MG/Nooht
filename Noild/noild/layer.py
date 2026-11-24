@@ -107,6 +107,7 @@ class NoildLayer(nn.Module):
         # 路由缓存（池化级）：重判间隔内复用，不每步重判；缓存只允许同请求/同池化批形状使用。
         self._cached_router: RouterOutput | None = None
         self._cache_request_id: str | int | None = None
+        self._last_inference_step: int | None = None
         self._loading_clock = 0  # 单调加载时钟，不随新请求的 generation step 归零
 
     def _module_for_expert(self, expert_id: str) -> nn.Module:
@@ -144,6 +145,7 @@ class NoildLayer(nn.Module):
         with self._router_state_lock:
             self._cached_router = None
             self._cache_request_id = request_id
+            self._last_inference_step = None
             self.rejudge.last_rejudge_step = -10**9
             self.rejudge.last_uncertainty_rejudge_step = -10**9
             self.rejudge.last_hidden = None
@@ -171,8 +173,13 @@ class NoildLayer(nn.Module):
         with self._router_state_lock:
             if not self.training:
                 request_changed = request_id != self._cache_request_id
-                if request_changed or step == 0:
+                step_discontinuous = (
+                    self._last_inference_step is not None
+                    and step != self._last_inference_step + 1
+                )
+                if request_changed or step == 0 or step_discontinuous:
                     self.reset_generation_state(request_id=request_id)
+                self._last_inference_step = step
             if domain_hint is not None:
                 pooled_router = self.router.judge_user_input(pooled)
                 hint = torch.as_tensor(domain_hint, device=pooled.device, dtype=torch.long)
@@ -320,7 +327,7 @@ class NoildLayer(nn.Module):
             return_aux_logits: 默认训练时计算 draft/MTP logits，推理时跳过未用辅助大词表头；
                 可显式开启以用于验证/消融。
             request_id: 可选请求标识；同一生成请求的每次 forward 传相同 ID，变化时自动清空缓存。
-                不传时应以 step=0 开始新请求，或显式调用 reset_generation_state()。
+                未传 ID 时 step=0 或步数不连续会清空缓存；也可显式调用 reset_generation_state()。
         """
         if self._offload_device is not None:
             if self.training or torch.is_grad_enabled():
