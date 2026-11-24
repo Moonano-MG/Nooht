@@ -321,14 +321,16 @@ class TestLayer(unittest.TestCase):
         layer.router.judge_user_input = counted
         first = layer(torch.randn(2, 3, cfg.hidden_size), step=4, request_id="request-a")
         self.assertEqual(first.rejudge_reason, "first")
+        changed_batch_hidden = torch.randn(3, 3, cfg.hidden_size)
         changed_batch = layer(
-            torch.randn(3, 3, cfg.hidden_size), step=5, request_id="request-a"
+            changed_batch_hidden, step=5, request_id="request-a"
         )
         self.assertEqual(changed_batch.rejudge_reason, "cache_mismatch")
         self.assertEqual(changed_batch.hidden.shape, (3, 3, cfg.hidden_size))
         self.assertEqual(calls, 2)
+        # An identical/similar input on a different request must not inherit the prior route.
         changed_request = layer(
-            torch.randn(3, 3, cfg.hidden_size), step=6, request_id="request-b"
+            changed_batch_hidden, step=6, request_id="request-b"
         )
         self.assertEqual(changed_request.rejudge_reason, "first")
         self.assertEqual(calls, 3)
@@ -524,6 +526,10 @@ class TestLayer(unittest.TestCase):
         layer = NoildLayer(cfg, path=("router", "draft", "general", "vertical", "merge"), use_loading=False)
         head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size)
         optimizer = torch.optim.AdamW(list(layer.parameters()) + list(head.parameters()), lr=1e-3)
+        with self.assertRaisesRegex(KeyError, "'hidden'"):
+            train_noild(layer, head, [{"target_ids": torch.ones(1, 1, dtype=torch.long)}], optimizer)
+        with self.assertRaisesRegex(KeyError, "'target_ids'"):
+            train_noild(layer, head, [{"hidden": torch.randn(1, 1, cfg.hidden_size)}], optimizer)
         batch_size, seq = 2, 4
         batch = {
             "hidden": torch.randn(batch_size, seq, cfg.hidden_size),

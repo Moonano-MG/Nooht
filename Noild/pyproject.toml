@@ -2,7 +2,7 @@
 # 版本与 Nooht 主仓库一致：v0.1.0-dev（本阶段不升版，不随意改版）
 # 仅依赖 torch，不依赖 Nooht；其他混合架构可独立接入
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ name = "noild"
 version = "0.1.0.dev0"
 description = "Role-Specialized Cascaded Experts: role-specialized cascaded sparse layer (Noild)"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
