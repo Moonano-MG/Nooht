@@ -1,16 +1,12 @@
 name: train-noild
 
 # Same-budget pair training, Noild side (Jamba with 2 MoE blocks replaced by NoildLayer).
-# Seeds 0, 1, 2 run as parallel jobs. A newer push cancels the older in-progress run of the same seed.
+# Seeds 0, 1, 2 run as parallel jobs. A newer dispatch cancels the older in-progress run of the same seed.
 # Model: medium (8 layers, hidden 256, 8 experts, ~16.8M params), 2000 steps for safer runtime margin.
 # Hard limit: job timeout 60 min; the script also stops training after --max_minutes (45).
 
+# This six-job benchmark is intentionally manual to avoid costly runs on every training-code push.
 on:
-  push:
-    branches: [v0.1.0-dev, arena/9241b18b-nooht]
-    paths:
-      - "scripts/pair_train/**"
-      - ".github/workflows/train-noild.yml"
   workflow_dispatch:
     inputs:
       steps:
@@ -36,9 +32,9 @@ jobs:
       STEPS: ${{ inputs.steps || '2000' }}
       SEED: ${{ matrix.seed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
@@ -74,7 +70,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: train-noild-seed${{ matrix.seed }}
           path: |

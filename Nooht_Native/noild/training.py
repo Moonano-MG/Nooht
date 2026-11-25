@@ -194,8 +194,10 @@ def train_noild(
     lm_head.train()
     history: list[dict[str, float | str]] = []
     for step, batch in enumerate(batches):
-        if "hidden" not in batch or "target_ids" not in batch:
-            raise KeyError("每个 batch 必须含 hidden 和 target_ids。")
+        if "hidden" not in batch:
+            raise KeyError("train_noild batch 缺少必需字段 'hidden'。")
+        if "target_ids" not in batch:
+            raise KeyError("train_noild batch 缺少必需字段 'target_ids'。")
         hidden = batch["hidden"]
         targets = batch["target_ids"]
         optimizer.zero_grad(set_to_none=True)
